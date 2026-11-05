@@ -22,3 +22,10 @@
   and lock its exact argument contract with parser-to-command regression tests.
 - Validate Ruffle gamepad button and Flash key names before process launch.
 - Keep `make push` scoped to the configured GitHub remote.
+- Add `lan discover`, `lan host`, and `lan join` with same-subnet directed UDP
+  discovery and strict protocol/SWF/runtime/profile/session hash negotiation.
+- Default LAN peers to private/local addresses and the configured IPv4 prefix;
+  expose bind, interface, prefix, discovery, negotiation, input-metadata, and
+  media-metadata controls without mutating firewall or router state.
+- Keep the LAN contract truthful: the host is authoritative, while remote input
+  injection and low-latency media streaming remain explicitly unimplemented.

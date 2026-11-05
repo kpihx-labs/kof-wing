@@ -1,20 +1,185 @@
-use std::{net::UdpSocket, path::Path, process::Command};
+use std::{
+    collections::BTreeMap,
+    io::ErrorKind,
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    path::Path,
+    process::Command,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
-use crate::runtime::{self, Platform};
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-pub fn doctor(work: &Path) {
-    println!("LAN preservation boundary (diagnostics only; play is not implemented):");
-    match UdpSocket::bind("0.0.0.0:0") {
-        Ok(socket) => println!(
-            "  [ok] local UDP bind: {}",
-            socket
-                .local_addr()
-                .map_or_else(|_| "available".to_owned(), |address| address.to_string())
-        ),
-        Err(error) => println!("  [missing] local UDP bind: {error}"),
+use crate::{
+    cli::{LanDiscoveryArgs, LanHostArgs, LanJoinArgs, LanNetworkArgs},
+    profile::ProfilePaths,
+    runtime::{
+        self, LINUX_RUFFLE_ARCHIVE_SHA256, Platform, RUFFLE_VERSION, WINDOWS_RUFFLE_ARCHIVE_SHA256,
+    },
+    source::SWF_SHA256,
+};
+
+pub const PROTOCOL_VERSION: u16 = 1;
+const WIRE_MAGIC: &str = "kof-wing-lan";
+const MAX_PACKET_SIZE: usize = 8_192;
+const MAX_UDP_DATAGRAM_SIZE: usize = 65_535;
+const FUTURE_CLOCK_TOLERANCE_MS: u64 = 5_000;
+const HOST_PACKET_MAX_AGE_MS: u64 = 5_000;
+const REPLAY_GUARD_MAX_ENTRIES: usize = 256;
+const NONCE_LENGTH: usize = 32;
+const SESSION_ID_LENGTH: usize = 32;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Compatibility {
+    pub swf_sha256: String,
+    pub runtime_sha256: String,
+    pub profile_sha256: String,
+    pub session_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointMetadata {
+    pub endpoint: SocketAddr,
+    pub transport: String,
+    pub format: String,
+    pub status: CapabilityStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilityStatus {
+    MetadataOnly,
+    NotImplemented,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDescriptor {
+    pub session_id: String,
+    pub name: String,
+    pub negotiation_endpoint: SocketAddr,
+    pub compatibility: Compatibility,
+    pub authoritative_host: bool,
+    pub remote_input: EndpointMetadata,
+    pub media: EndpointMetadata,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum WireMessage {
+    Probe {
+        nonce: String,
+    },
+    Announcement {
+        nonce: String,
+        session: SessionDescriptor,
+    },
+    JoinRequest {
+        nonce: String,
+        session_id: Option<String>,
+        compatibility: Compatibility,
+    },
+    JoinResponse {
+        nonce: String,
+        accepted: bool,
+        reason: String,
+        session: Option<SessionDescriptor>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Packet {
+    magic: String,
+    protocol_version: u16,
+    sent_at_ms: u64,
+    message: WireMessage,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiscoveredSession {
+    pub session: SessionDescriptor,
+    pub compatible: bool,
+    pub incompatibility: Option<String>,
+}
+
+#[derive(Default)]
+struct ReplayGuard {
+    seen: BTreeMap<String, u64>,
+}
+
+impl ReplayGuard {
+    fn accept(&mut self, nonce: &str) -> bool {
+        self.accept_at(nonce, now_ms())
     }
+
+    fn accept_at(&mut self, nonce: &str, now: u64) -> bool {
+        self.seen
+            .retain(|_, received_at| now.saturating_sub(*received_at) <= HOST_PACKET_MAX_AGE_MS);
+        if self.seen.contains_key(nonce) || self.seen.len() >= REPLAY_GUARD_MAX_ENTRIES {
+            return false;
+        }
+        self.seen.insert(nonce.to_owned(), now);
+        true
+    }
+}
+
+pub fn doctor(work: &Path, profile_name: &str, network: &LanNetworkArgs) {
+    println!("LAN zero-service diagnostics:");
+    let interface = match resolve_interface(network.interface) {
+        Ok(interface) => {
+            report_address("interface", interface, network.allow_public);
+            Some(interface)
+        }
+        Err(error) => {
+            println!("  [missing] interface: {error:#}");
+            None
+        }
+    };
+    report_address("bind", network.bind, network.allow_public);
+
+    for (label, port) in [
+        ("discovery", network.discovery_port),
+        ("negotiation", network.session_port),
+    ] {
+        match UdpSocket::bind(SocketAddr::new(network.bind, port)) {
+            Ok(socket) => println!(
+                "  [ok] {label} UDP bind: {}",
+                socket
+                    .local_addr()
+                    .map_or_else(|_| "available".to_owned(), |address| address.to_string())
+            ),
+            Err(error) => println!("  [missing] {label} UDP bind: {error}"),
+        }
+    }
+
+    match local_compatibility(profile_name) {
+        Ok(contract) => {
+            println!("  [ok] SWF contract SHA-256: {}", contract.swf_sha256);
+            println!(
+                "  [ok] runtime contract SHA-256: {}",
+                contract.runtime_sha256
+            );
+            println!(
+                "  [ok] profile contract SHA-256: {}",
+                contract.profile_sha256
+            );
+            println!(
+                "  [ok] session contract SHA-256: {}",
+                contract.session_sha256
+            );
+        }
+        Err(error) => println!("  [missing] compatibility contract: {error:#}"),
+    }
+
     match Command::new("ffmpeg").arg("-version").output() {
-        Ok(output) if output.status.success() => println!("  [ok] ffmpeg available"),
+        Ok(output) if output.status.success() => {
+            println!("  [ok] ffmpeg available (not wired to LAN media)")
+        }
         Ok(output) => println!("  [missing] ffmpeg failed with {}", output.status),
         Err(error) => println!("  [missing] ffmpeg unavailable: {error}"),
     }
@@ -25,6 +190,1209 @@ pub fn doctor(work: &Path) {
         Ok(path) => println!("  [ok] pinned host runtime: {}", path.display()),
         Err(error) => println!("  [missing] pinned host runtime: {error:#}"),
     }
-    println!("  [not implemented] discovery, input transport, media stream, reconnect, security");
-    println!("LAN readiness: unavailable by design in 0.1.0");
+    if let Some(IpAddr::V4(interface)) = interface {
+        match directed_broadcast(interface, network.prefix_len) {
+            Ok(address) => println!(
+                "  [ok] /{} directed discovery broadcast: {address}:{}",
+                network.prefix_len, network.discovery_port
+            ),
+            Err(error) => println!("  [missing] discovery broadcast: {error:#}"),
+        }
+    }
+    println!("  [implemented] discovery and strict session negotiation");
+    println!("  [not implemented] remote input injection, media capture/streaming, reconnect");
+    println!("LAN gameplay readiness: unavailable until transports and the two-PC gate pass");
+}
+
+pub fn discover(profile_name: &str, args: &LanDiscoveryArgs) -> Result<Vec<DiscoveredSession>> {
+    let interface = checked_interface(&args.network)?;
+    let local = local_compatibility(profile_name)?;
+    discover_with_contract(interface, &local, args)
+}
+
+pub fn host(profile_name: &str, args: &LanHostArgs) -> Result<()> {
+    ensure!(
+        !args.name.trim().is_empty() && args.name.trim().len() <= 64,
+        "session name must be 1-64 bytes"
+    );
+    ensure_distinct_ports(args)?;
+    let interface = checked_interface(&args.network)?;
+    let compatibility = local_compatibility(profile_name)?;
+    let descriptor = session_descriptor(interface, &compatibility, args)?;
+    let discovery = bind_socket(args.network.bind, args.network.discovery_port, "discovery")?;
+    let negotiation = bind_socket(args.network.bind, args.network.session_port, "negotiation")?;
+    discovery.set_nonblocking(true)?;
+    negotiation.set_nonblocking(true)?;
+
+    println!("authoritative host session: {}", descriptor.session_id);
+    println!("discovery: {}:{}", interface, args.network.discovery_port);
+    println!("negotiation: {}", descriptor.negotiation_endpoint);
+    println!("session contract SHA-256: {}", compatibility.session_sha256);
+    println!("remote input endpoint is metadata only; injection is not implemented");
+    println!("media endpoint is metadata only; capture/streaming is not implemented");
+
+    let mut buffer = [0_u8; MAX_UDP_DATAGRAM_SIZE];
+    let mut replay_guard = ReplayGuard::default();
+    loop {
+        if let Err(error) = receive_probe(&discovery, &mut buffer, interface, args, &descriptor) {
+            eprintln!("ignored discovery request error: {error:#}");
+        }
+        match receive_join(
+            &negotiation,
+            &mut buffer,
+            interface,
+            args,
+            &descriptor,
+            &mut replay_guard,
+        ) {
+            Ok(true) if args.once => return Ok(()),
+            Ok(_) => {}
+            Err(error) => eprintln!("ignored negotiation request error: {error:#}"),
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub fn join(profile_name: &str, args: &LanJoinArgs) -> Result<SessionDescriptor> {
+    let interface = checked_interface(&args.discovery.network)?;
+    let local = local_compatibility(profile_name)?;
+    let (endpoint, expected_session_id) = if let Some(endpoint) = args.host {
+        ensure!(
+            endpoint.port() != 0,
+            "host negotiation port must be non-zero"
+        );
+        validate_peer(
+            endpoint.ip(),
+            interface,
+            args.discovery.network.prefix_len,
+            args.discovery.network.allow_public,
+        )?;
+        (endpoint, None)
+    } else {
+        let compatible: Vec<_> = discover_with_contract(interface, &local, &args.discovery)?
+            .into_iter()
+            .filter(|result| result.compatible)
+            .collect();
+        ensure!(
+            compatible.len() == 1,
+            "automatic join requires exactly one compatible discovered session; found {}",
+            compatible.len()
+        );
+        (
+            compatible[0].session.negotiation_endpoint,
+            Some(compatible[0].session.session_id.clone()),
+        )
+    };
+    negotiate(
+        interface,
+        endpoint,
+        expected_session_id.as_deref(),
+        &local,
+        args,
+    )
+}
+
+pub fn local_compatibility(profile_name: &str) -> Result<Compatibility> {
+    let profile = ProfilePaths::discover(profile_name)?;
+    let config = profile.require_config()?;
+    let canonical_profile =
+        toml::to_string(&config).context("cannot canonicalize profile config")?;
+    Ok(compatibility_from_profile(canonical_profile.as_bytes()))
+}
+
+fn compatibility_from_profile(profile: &[u8]) -> Compatibility {
+    let runtime_sha256 = sha256_bytes(runtime_contract().as_bytes());
+    let profile_sha256 = sha256_bytes(profile);
+    let session_sha256 = session_contract_hash(SWF_SHA256, &runtime_sha256, &profile_sha256);
+    Compatibility {
+        swf_sha256: SWF_SHA256.to_owned(),
+        runtime_sha256,
+        profile_sha256,
+        session_sha256,
+    }
+}
+
+fn runtime_contract() -> String {
+    format!(
+        "ruffle={RUFFLE_VERSION};linux-archive={LINUX_RUFFLE_ARCHIVE_SHA256};windows-archive={WINDOWS_RUFFLE_ARCHIVE_SHA256};power=high;quality=high16x16;open-url=deny;filesystem=allow;storage=disk"
+    )
+}
+
+fn session_descriptor(
+    interface: Ipv4Addr,
+    compatibility: &Compatibility,
+    args: &LanHostArgs,
+) -> Result<SessionDescriptor> {
+    Ok(SessionDescriptor {
+        session_id: random_hex(SESSION_ID_LENGTH / 2)?,
+        name: args.name.trim().to_owned(),
+        negotiation_endpoint: SocketAddr::new(interface.into(), args.network.session_port),
+        compatibility: compatibility.clone(),
+        authoritative_host: true,
+        remote_input: EndpointMetadata {
+            endpoint: SocketAddr::new(interface.into(), args.input_port),
+            transport: "udp".to_owned(),
+            format: "remote-player-input-v1".to_owned(),
+            status: CapabilityStatus::NotImplemented,
+        },
+        media: EndpointMetadata {
+            endpoint: SocketAddr::new(interface.into(), args.media_port),
+            transport: "udp".to_owned(),
+            format: "low-latency-media-unselected".to_owned(),
+            status: CapabilityStatus::MetadataOnly,
+        },
+    })
+}
+
+fn discover_with_contract(
+    interface: Ipv4Addr,
+    local: &Compatibility,
+    args: &LanDiscoveryArgs,
+) -> Result<Vec<DiscoveredSession>> {
+    let client_bind = client_bind_address(args.network.bind, interface)?;
+    let socket = UdpSocket::bind(SocketAddr::new(client_bind, 0))
+        .with_context(|| format!("cannot bind discovery client to {client_bind}:0"))?;
+    socket.set_broadcast(true)?;
+    let timeout = Duration::from_millis(args.timeout_ms);
+    socket.set_read_timeout(Some(timeout))?;
+    let nonce = nonce()?;
+    let probe = packet(WireMessage::Probe {
+        nonce: nonce.clone(),
+    });
+    let target = SocketAddr::new(
+        directed_broadcast(interface, args.network.prefix_len)?.into(),
+        args.network.discovery_port,
+    );
+    send_packet(&socket, target, &probe)?;
+
+    let started = Instant::now();
+    let mut sessions = BTreeMap::new();
+    let mut buffer = [0_u8; MAX_UDP_DATAGRAM_SIZE];
+    while let Some(remaining) = timeout.checked_sub(started.elapsed()) {
+        socket.set_read_timeout(Some(remaining))?;
+        match socket.recv_from(&mut buffer) {
+            Ok((size, source)) => {
+                let received = match decode_packet(&buffer[..size]) {
+                    Ok(received) => received,
+                    Err(_) => continue,
+                };
+                if validate_freshness(&received, args.stale_after_ms).is_err() {
+                    continue;
+                }
+                let WireMessage::Announcement {
+                    nonce: response_nonce,
+                    session,
+                } = received.message
+                else {
+                    continue;
+                };
+                if response_nonce != nonce {
+                    continue;
+                }
+                if validate_peer(
+                    source.ip(),
+                    interface,
+                    args.network.prefix_len,
+                    args.network.allow_public,
+                )
+                .is_err()
+                    || session.negotiation_endpoint.ip() != source.ip()
+                    || validate_descriptor(&session).is_err()
+                {
+                    continue;
+                }
+                let incompatibility = compatibility_difference(local, &session.compatibility);
+                sessions.insert(
+                    session.session_id.clone(),
+                    DiscoveredSession {
+                        compatible: incompatibility.is_none(),
+                        incompatibility,
+                        session,
+                    },
+                );
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                break;
+            }
+            Err(error) => return Err(error).context("cannot receive discovery announcement"),
+        }
+    }
+    Ok(sessions.into_values().collect())
+}
+
+fn negotiate(
+    interface: Ipv4Addr,
+    endpoint: SocketAddr,
+    expected_session_id: Option<&str>,
+    local: &Compatibility,
+    args: &LanJoinArgs,
+) -> Result<SessionDescriptor> {
+    let client_bind = client_bind_address(args.discovery.network.bind, interface)?;
+    let socket = UdpSocket::bind(SocketAddr::new(client_bind, 0))
+        .with_context(|| format!("cannot bind negotiation client to {}:0", client_bind))?;
+    let timeout = Duration::from_millis(args.discovery.timeout_ms);
+    socket.set_read_timeout(Some(timeout))?;
+    let nonce = nonce()?;
+    send_packet(
+        &socket,
+        endpoint,
+        &packet(WireMessage::JoinRequest {
+            nonce: nonce.clone(),
+            session_id: expected_session_id.map(str::to_owned),
+            compatibility: local.clone(),
+        }),
+    )?;
+    let mut buffer = [0_u8; MAX_UDP_DATAGRAM_SIZE];
+    let started = Instant::now();
+    while let Some(remaining) = timeout.checked_sub(started.elapsed()) {
+        socket.set_read_timeout(Some(remaining))?;
+        let (size, source) = match socket.recv_from(&mut buffer) {
+            Ok(received) => received,
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                break;
+            }
+            Err(error) => return Err(error).context("cannot receive host negotiation response"),
+        };
+        if source != endpoint {
+            continue;
+        }
+        let Ok(response) = decode_packet(&buffer[..size]) else {
+            continue;
+        };
+        if validate_freshness(&response, args.discovery.stale_after_ms).is_err() {
+            continue;
+        }
+        let WireMessage::JoinResponse {
+            nonce: response_nonce,
+            accepted,
+            reason,
+            session,
+        } = response.message
+        else {
+            continue;
+        };
+        if response_nonce != nonce {
+            continue;
+        }
+        ensure!(accepted, "host rejected session contract: {reason}");
+        let session = session.context("accepted negotiation omitted the session descriptor")?;
+        validate_descriptor(&session)?;
+        ensure!(
+            session.negotiation_endpoint == endpoint,
+            "host descriptor endpoint {} differs from contacted endpoint {endpoint}",
+            session.negotiation_endpoint
+        );
+        for advertised in [
+            session.negotiation_endpoint,
+            session.remote_input.endpoint,
+            session.media.endpoint,
+        ] {
+            validate_peer(
+                advertised.ip(),
+                interface,
+                args.discovery.network.prefix_len,
+                args.discovery.network.allow_public,
+            )?;
+        }
+        if let Some(expected) = expected_session_id {
+            ensure!(
+                session.session_id == expected,
+                "discovered session {expected} was replaced by {}",
+                session.session_id
+            );
+        }
+        if let Some(reason) = compatibility_difference(local, &session.compatibility) {
+            bail!("host accepted but returned an incompatible contract: {reason}");
+        }
+        return Ok(session);
+    }
+    bail!("timed out waiting for a valid host negotiation response")
+}
+
+fn receive_probe(
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+    interface: Ipv4Addr,
+    args: &LanHostArgs,
+    session: &SessionDescriptor,
+) -> Result<()> {
+    let Some((size, source)) = receive_nonblocking(socket, buffer, "discovery probe")? else {
+        return Ok(());
+    };
+    let request = match decode_packet(&buffer[..size]) {
+        Ok(request) => request,
+        Err(_) => return Ok(()),
+    };
+    if validate_freshness(&request, HOST_PACKET_MAX_AGE_MS).is_err() {
+        return Ok(());
+    }
+    let WireMessage::Probe { nonce } = request.message else {
+        return Ok(());
+    };
+    if !valid_nonce(&nonce) {
+        return Ok(());
+    }
+    if validate_peer(
+        source.ip(),
+        interface,
+        args.network.prefix_len,
+        args.network.allow_public,
+    )
+    .is_err()
+    {
+        return Ok(());
+    }
+    send_packet(
+        socket,
+        source,
+        &packet(WireMessage::Announcement {
+            nonce,
+            session: session.clone(),
+        }),
+    )
+}
+
+fn receive_join(
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+    interface: Ipv4Addr,
+    args: &LanHostArgs,
+    session: &SessionDescriptor,
+    replay_guard: &mut ReplayGuard,
+) -> Result<bool> {
+    let Some((size, source)) = receive_nonblocking(socket, buffer, "join request")? else {
+        return Ok(false);
+    };
+    let request = match decode_packet(&buffer[..size]) {
+        Ok(request) => request,
+        Err(_) => return Ok(false),
+    };
+    if validate_freshness(&request, HOST_PACKET_MAX_AGE_MS).is_err() {
+        return Ok(false);
+    }
+    let WireMessage::JoinRequest {
+        nonce,
+        session_id,
+        compatibility,
+    } = request.message
+    else {
+        return Ok(false);
+    };
+    if !valid_nonce(&nonce) {
+        return Ok(false);
+    }
+    if validate_peer(
+        source.ip(),
+        interface,
+        args.network.prefix_len,
+        args.network.allow_public,
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
+    if !replay_guard.accept(&nonce) {
+        return Ok(false);
+    }
+    let difference = compatibility_difference(&session.compatibility, &compatibility);
+    let contract_error = validate_compatibility(&compatibility)
+        .err()
+        .map(|error| format!("invalid compatibility contract: {error:#}"));
+    let session_error = session_id
+        .filter(|expected| expected != &session.session_id)
+        .map(|expected| format!("requested session {expected} is no longer active"));
+    let rejection = contract_error.or(session_error).or(difference);
+    let accepted = rejection.is_none();
+    let reason = rejection.unwrap_or_else(|| {
+        "compatibility hashes match; transport capabilities remain unavailable".to_owned()
+    });
+    send_packet(
+        socket,
+        source,
+        &packet(WireMessage::JoinResponse {
+            nonce,
+            accepted,
+            reason,
+            session: accepted.then(|| session.clone()),
+        }),
+    )?;
+    Ok(accepted)
+}
+
+fn receive_nonblocking(
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+    context: &str,
+) -> Result<Option<(usize, SocketAddr)>> {
+    match socket.recv_from(buffer) {
+        Ok(result) => Ok(Some(result)),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("cannot receive {context}")),
+    }
+}
+
+fn packet(message: WireMessage) -> Packet {
+    Packet {
+        magic: WIRE_MAGIC.to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        sent_at_ms: now_ms(),
+        message,
+    }
+}
+
+fn send_packet(socket: &UdpSocket, target: SocketAddr, message: &Packet) -> Result<()> {
+    let bytes = serde_json::to_vec(message).context("cannot encode LAN packet")?;
+    ensure!(
+        bytes.len() <= MAX_PACKET_SIZE,
+        "LAN packet exceeds {MAX_PACKET_SIZE} bytes"
+    );
+    socket
+        .send_to(&bytes, target)
+        .with_context(|| format!("cannot send LAN packet to {target}"))?;
+    Ok(())
+}
+
+fn decode_packet(bytes: &[u8]) -> Result<Packet> {
+    ensure!(!bytes.is_empty(), "empty LAN packet");
+    ensure!(
+        bytes.len() <= MAX_PACKET_SIZE,
+        "LAN packet exceeds {MAX_PACKET_SIZE} bytes"
+    );
+    let packet: Packet = serde_json::from_slice(bytes).context("invalid LAN packet")?;
+    ensure!(packet.magic == WIRE_MAGIC, "invalid LAN packet magic");
+    ensure!(
+        packet.protocol_version == PROTOCOL_VERSION,
+        "unsupported LAN protocol version {} (expected {PROTOCOL_VERSION})",
+        packet.protocol_version
+    );
+    Ok(packet)
+}
+
+fn validate_freshness(packet: &Packet, stale_after_ms: u64) -> Result<()> {
+    let now = now_ms();
+    ensure!(
+        packet.sent_at_ms <= now.saturating_add(FUTURE_CLOCK_TOLERANCE_MS),
+        "LAN packet timestamp is too far in the future"
+    );
+    ensure!(
+        now.saturating_sub(packet.sent_at_ms) <= stale_after_ms,
+        "stale LAN packet"
+    );
+    Ok(())
+}
+
+fn validate_descriptor(session: &SessionDescriptor) -> Result<()> {
+    ensure!(
+        session.authoritative_host,
+        "peer did not declare an authoritative host"
+    );
+    ensure!(
+        session.session_id.len() == SESSION_ID_LENGTH
+            && session
+                .session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "session ID must be {SESSION_ID_LENGTH} hexadecimal characters"
+    );
+    ensure!(
+        !session.name.trim().is_empty() && session.name.len() <= 64,
+        "session name must be 1-64 bytes"
+    );
+    validate_compatibility(&session.compatibility)?;
+    ensure!(
+        session.negotiation_endpoint.port() != 0
+            && session.remote_input.endpoint.port() != 0
+            && session.media.endpoint.port() != 0,
+        "session contains a zero endpoint port"
+    );
+    ensure!(
+        session.remote_input.endpoint.ip() == session.negotiation_endpoint.ip()
+            && session.media.endpoint.ip() == session.negotiation_endpoint.ip(),
+        "session endpoint addresses disagree"
+    );
+    ensure!(
+        session.remote_input.status == CapabilityStatus::NotImplemented,
+        "unsupported remote-input capability claim"
+    );
+    ensure!(
+        session.media.status == CapabilityStatus::MetadataOnly,
+        "unsupported media capability claim"
+    );
+    ensure!(
+        session.remote_input.transport == "udp"
+            && session.remote_input.format == "remote-player-input-v1",
+        "unsupported remote-input endpoint contract"
+    );
+    ensure!(
+        session.media.transport == "udp" && session.media.format == "low-latency-media-unselected",
+        "unsupported media endpoint contract"
+    );
+    Ok(())
+}
+
+fn validate_compatibility(contract: &Compatibility) -> Result<()> {
+    for (label, hash) in [
+        ("SWF", contract.swf_sha256.as_str()),
+        ("runtime", contract.runtime_sha256.as_str()),
+        ("profile", contract.profile_sha256.as_str()),
+        ("session", contract.session_sha256.as_str()),
+    ] {
+        ensure!(
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+            "{label} hash must be 64 lowercase hexadecimal characters"
+        );
+    }
+    let expected_session = session_contract_hash(
+        &contract.swf_sha256,
+        &contract.runtime_sha256,
+        &contract.profile_sha256,
+    );
+    ensure!(
+        contract.session_sha256 == expected_session,
+        "session hash does not bind the advertised component hashes"
+    );
+    Ok(())
+}
+
+fn session_contract_hash(swf: &str, runtime: &str, profile: &str) -> String {
+    sha256_bytes(
+        format!(
+            "protocol={PROTOCOL_VERSION};swf={swf};runtime={runtime};profile={profile};authority=host;input=not-implemented;media=metadata-only;reconnect=not-implemented"
+        )
+        .as_bytes(),
+    )
+}
+
+fn compatibility_difference(expected: &Compatibility, actual: &Compatibility) -> Option<String> {
+    let mut differences = Vec::new();
+    if expected.swf_sha256 != actual.swf_sha256 {
+        differences.push("SWF hash");
+    }
+    if expected.runtime_sha256 != actual.runtime_sha256 {
+        differences.push("runtime hash");
+    }
+    if expected.profile_sha256 != actual.profile_sha256 {
+        differences.push("profile hash");
+    }
+    if expected.session_sha256 != actual.session_sha256 {
+        differences.push("session hash");
+    }
+    (!differences.is_empty()).then(|| format!("incompatible {}", differences.join(", ")))
+}
+
+pub fn address_allowed(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_private() || address.is_loopback() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            address.is_unique_local() || address.is_loopback() || address.is_unicast_link_local()
+        }
+    }
+}
+
+fn checked_interface(network: &LanNetworkArgs) -> Result<Ipv4Addr> {
+    ensure!(
+        matches!(network.bind, IpAddr::V4(_)),
+        "LAN bind address must be IPv4; use 0.0.0.0 or the selected IPv4 interface"
+    );
+    ensure!(
+        network.discovery_port != 0 && network.session_port != 0,
+        "discovery and negotiation ports must be non-zero"
+    );
+    let interface = resolve_interface(network.interface)?;
+    ensure!(
+        network.allow_public || address_allowed(interface),
+        "interface {interface} is not private, loopback, or link-local; pass --allow-public to override"
+    );
+    let IpAddr::V4(interface) = interface else {
+        bail!("LAN discovery currently requires an IPv4 interface")
+    };
+    if !network.bind.is_unspecified() {
+        ensure!(
+            network.allow_public || address_allowed(network.bind),
+            "bind address {} is not private, loopback, or link-local",
+            network.bind
+        );
+        ensure!(
+            network.bind == IpAddr::V4(interface),
+            "concrete bind address {} must match interface {interface}",
+            network.bind
+        );
+    }
+    Ok(interface)
+}
+
+fn client_bind_address(configured: IpAddr, interface: Ipv4Addr) -> Result<IpAddr> {
+    if configured.is_unspecified() {
+        return Ok(interface.into());
+    }
+    ensure!(
+        configured == IpAddr::V4(interface),
+        "concrete bind address {configured} must match interface {interface}"
+    );
+    Ok(configured)
+}
+
+fn resolve_interface(configured: Option<IpAddr>) -> Result<IpAddr> {
+    if let Some(interface) = configured {
+        ensure!(
+            !interface.is_unspecified(),
+            "interface address cannot be unspecified"
+        );
+        return Ok(interface);
+    }
+    let socket = UdpSocket::bind("0.0.0.0:0").context("cannot open interface probe socket")?;
+    socket
+        .connect("192.0.2.1:9")
+        .context("cannot resolve a default local interface; pass --interface")?;
+    Ok(socket.local_addr()?.ip())
+}
+
+fn validate_peer(
+    peer: IpAddr,
+    interface: Ipv4Addr,
+    prefix_len: u8,
+    allow_public: bool,
+) -> Result<()> {
+    ensure!(
+        allow_public || address_allowed(peer),
+        "peer {peer} is not private or local"
+    );
+    let IpAddr::V4(peer) = peer else {
+        bail!("IPv6 peers are not supported by IPv4 discovery")
+    };
+    ensure!(
+        same_subnet(interface, peer, prefix_len)?,
+        "peer {peer} is outside {interface}/{prefix_len}"
+    );
+    Ok(())
+}
+
+fn same_subnet(left: Ipv4Addr, right: Ipv4Addr, prefix_len: u8) -> Result<bool> {
+    let mask = subnet_mask(prefix_len)?;
+    Ok(u32::from(left) & mask == u32::from(right) & mask)
+}
+
+fn directed_broadcast(interface: Ipv4Addr, prefix_len: u8) -> Result<Ipv4Addr> {
+    let mask = subnet_mask(prefix_len)?;
+    Ok(Ipv4Addr::from((u32::from(interface) & mask) | !mask))
+}
+
+fn subnet_mask(prefix_len: u8) -> Result<u32> {
+    ensure!(
+        (1..=32).contains(&prefix_len),
+        "IPv4 prefix length must be 1-32"
+    );
+    Ok(u32::MAX << (32 - prefix_len))
+}
+
+fn bind_socket(bind: IpAddr, port: u16, label: &str) -> Result<UdpSocket> {
+    UdpSocket::bind(SocketAddr::new(bind, port))
+        .with_context(|| format!("cannot bind {label} UDP socket to {bind}:{port}"))
+}
+
+fn ensure_distinct_ports(args: &LanHostArgs) -> Result<()> {
+    let ports = [
+        args.network.discovery_port,
+        args.network.session_port,
+        args.input_port,
+        args.media_port,
+    ];
+    ensure!(
+        ports.iter().all(|port| *port != 0),
+        "host ports must be non-zero"
+    );
+    for (index, port) in ports.iter().enumerate() {
+        ensure!(
+            !ports[..index].contains(port),
+            "discovery, negotiation, input, and media ports must be distinct"
+        );
+    }
+    Ok(())
+}
+
+fn report_address(label: &str, address: IpAddr, allow_public: bool) {
+    if address.is_unspecified() || allow_public || address_allowed(address) {
+        println!("  [ok] {label} address policy: {address}");
+    } else {
+        println!("  [rejected] {label} address policy: {address} is public");
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn random_hex(byte_length: usize) -> Result<String> {
+    let mut bytes = vec![0_u8; byte_length];
+    getrandom::fill(&mut bytes).context("cannot obtain operating-system randomness")?;
+    let mut encoded = String::with_capacity(byte_length * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(encoded)
+}
+
+fn nonce() -> Result<String> {
+    random_hex(NONCE_LENGTH / 2)
+}
+
+fn valid_nonce(value: &str) -> bool {
+    value.len() == NONCE_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn now_ms() -> u64 {
+    let milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(milliseconds).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compatibility(profile: &[u8]) -> Compatibility {
+        compatibility_from_profile(profile)
+    }
+
+    fn loopback_host_args() -> LanHostArgs {
+        LanHostArgs {
+            network: LanNetworkArgs {
+                bind: "127.0.0.1".parse().unwrap(),
+                interface: Some("127.0.0.1".parse().unwrap()),
+                prefix_len: 8,
+                discovery_port: 27_880,
+                session_port: 27_881,
+                allow_public: false,
+            },
+            name: "fixture".to_owned(),
+            input_port: 27_882,
+            media_port: 27_883,
+            once: true,
+        }
+    }
+
+    fn fixture_nonce(character: char) -> String {
+        std::iter::repeat_n(character, NONCE_LENGTH).collect()
+    }
+
+    #[test]
+    fn replay_guard_is_bounded_rejects_duplicates_and_prunes_expired_entries() {
+        let mut guard = ReplayGuard::default();
+        for index in 0..REPLAY_GUARD_MAX_ENTRIES {
+            assert!(guard.accept_at(&format!("nonce-{index}"), 1));
+        }
+        assert_eq!(guard.seen.len(), REPLAY_GUARD_MAX_ENTRIES);
+        assert!(!guard.accept_at("nonce-0", 1));
+        assert!(!guard.accept_at("unseen-at-capacity", 1));
+        assert_eq!(guard.seen.len(), REPLAY_GUARD_MAX_ENTRIES);
+
+        let after_expiry = 1 + HOST_PACKET_MAX_AGE_MS + 1;
+        assert!(guard.accept_at("unseen-after-expiry", after_expiry));
+        assert_eq!(guard.seen.len(), 1);
+        assert!(guard.seen.contains_key("unseen-after-expiry"));
+    }
+
+    #[test]
+    fn packet_round_trip_and_malformed_rejection() {
+        let original = packet(WireMessage::Probe {
+            nonce: "fixture".to_owned(),
+        });
+        let encoded = serde_json::to_vec(&original).expect("encode fixture");
+        assert_eq!(decode_packet(&encoded).expect("decode fixture"), original);
+        assert!(decode_packet(&[]).is_err());
+        assert!(decode_packet(b"not-json").is_err());
+        assert!(decode_packet(&encoded[..encoded.len() - 1]).is_err());
+        assert!(decode_packet(&vec![b'x'; MAX_PACKET_SIZE + 1]).is_err());
+
+        let unknown_field = serde_json::json!({
+            "magic": WIRE_MAGIC,
+            "protocol_version": PROTOCOL_VERSION,
+            "sent_at_ms": now_ms(),
+            "message": {"type": "probe", "nonce": "fixture", "extra": true}
+        });
+        assert!(decode_packet(&serde_json::to_vec(&unknown_field).unwrap()).is_err());
+
+        let wrong_version = serde_json::json!({
+            "magic": WIRE_MAGIC,
+            "protocol_version": PROTOCOL_VERSION + 1,
+            "sent_at_ms": now_ms(),
+            "message": {"type": "probe", "nonce": "fixture"}
+        });
+        assert!(decode_packet(&serde_json::to_vec(&wrong_version).unwrap()).is_err());
+    }
+
+    #[test]
+    fn rejects_every_incompatible_contract_hash() {
+        let expected = compatibility(b"profile-a");
+        let mut actual = expected.clone();
+        actual.profile_sha256 = "different".to_owned();
+        assert_eq!(
+            compatibility_difference(&expected, &actual).as_deref(),
+            Some("incompatible profile hash")
+        );
+
+        actual = expected.clone();
+        actual.runtime_sha256 = "different".to_owned();
+        assert!(
+            compatibility_difference(&expected, &actual)
+                .expect("runtime mismatch")
+                .contains("runtime hash")
+        );
+
+        actual = expected.clone();
+        actual.swf_sha256 = "different".to_owned();
+        assert!(
+            compatibility_difference(&expected, &actual)
+                .expect("SWF mismatch")
+                .contains("SWF hash")
+        );
+
+        actual = expected.clone();
+        actual.session_sha256 = "different".to_owned();
+        assert!(
+            compatibility_difference(&expected, &actual)
+                .expect("session mismatch")
+                .contains("session hash")
+        );
+    }
+
+    #[test]
+    fn host_negotiation_rejects_incompatible_client_packet() {
+        let args = loopback_host_args();
+        let host_contract = compatibility(b"host-profile");
+        let descriptor =
+            session_descriptor("127.0.0.1".parse().unwrap(), &host_contract, &args).unwrap();
+        let host = UdpSocket::bind("127.0.0.1:0").expect("bind host fixture");
+        host.set_nonblocking(true).unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").expect("bind client fixture");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        send_packet(
+            &client,
+            host.local_addr().unwrap(),
+            &packet(WireMessage::JoinRequest {
+                nonce: fixture_nonce('a'),
+                session_id: Some(descriptor.session_id.clone()),
+                compatibility: compatibility(b"different-profile"),
+            }),
+        )
+        .unwrap();
+
+        let mut buffer = [0_u8; MAX_UDP_DATAGRAM_SIZE];
+        let mut replay_guard = ReplayGuard::default();
+        assert!(
+            !receive_join(
+                &host,
+                &mut buffer,
+                "127.0.0.1".parse().unwrap(),
+                &args,
+                &descriptor,
+                &mut replay_guard,
+            )
+            .unwrap()
+        );
+        let (size, _) = client.recv_from(&mut buffer).expect("receive rejection");
+        let response = decode_packet(&buffer[..size]).expect("decode rejection");
+        let WireMessage::JoinResponse {
+            accepted,
+            reason,
+            session,
+            ..
+        } = response.message
+        else {
+            panic!("expected join response")
+        };
+        assert!(!accepted);
+        assert!(reason.contains("profile hash"));
+        assert!(reason.contains("session hash"));
+        assert!(session.is_none());
+    }
+
+    #[test]
+    fn host_discovery_and_successful_negotiation_use_udp() {
+        let args = loopback_host_args();
+        let contract = compatibility(b"shared-profile");
+        let descriptor =
+            session_descriptor("127.0.0.1".parse().unwrap(), &contract, &args).unwrap();
+        let host = UdpSocket::bind("127.0.0.1:0").expect("bind host fixture");
+        host.set_nonblocking(true).unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").expect("bind client fixture");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut buffer = [0_u8; MAX_UDP_DATAGRAM_SIZE];
+        let mut replay_guard = ReplayGuard::default();
+
+        send_packet(
+            &client,
+            host.local_addr().unwrap(),
+            &packet(WireMessage::Probe {
+                nonce: fixture_nonce('a'),
+            }),
+        )
+        .unwrap();
+        receive_probe(
+            &host,
+            &mut buffer,
+            "127.0.0.1".parse().unwrap(),
+            &args,
+            &descriptor,
+        )
+        .unwrap();
+        let (size, _) = client.recv_from(&mut buffer).expect("receive announcement");
+        assert!(matches!(
+            decode_packet(&buffer[..size]).unwrap().message,
+            WireMessage::Announcement { session, .. } if session == descriptor
+        ));
+
+        send_packet(
+            &client,
+            host.local_addr().unwrap(),
+            &packet(WireMessage::JoinRequest {
+                nonce: "too-short".to_owned(),
+                session_id: Some(descriptor.session_id.clone()),
+                compatibility: contract.clone(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            !receive_join(
+                &host,
+                &mut buffer,
+                "127.0.0.1".parse().unwrap(),
+                &args,
+                &descriptor,
+                &mut replay_guard,
+            )
+            .unwrap()
+        );
+
+        let replay_client = UdpSocket::bind("127.0.0.1:0").expect("bind replay fixture");
+        send_packet(
+            &client,
+            host.local_addr().unwrap(),
+            &packet(WireMessage::JoinRequest {
+                nonce: fixture_nonce('b'),
+                session_id: Some(descriptor.session_id.clone()),
+                compatibility: contract.clone(),
+            }),
+        )
+        .unwrap();
+        assert!(
+            receive_join(
+                &host,
+                &mut buffer,
+                "127.0.0.1".parse().unwrap(),
+                &args,
+                &descriptor,
+                &mut replay_guard,
+            )
+            .unwrap()
+        );
+        let (size, _) = client.recv_from(&mut buffer).expect("receive acceptance");
+        let response = decode_packet(&buffer[..size]).expect("decode acceptance");
+        assert!(matches!(
+            response.message,
+            WireMessage::JoinResponse {
+                accepted: true,
+                session: Some(session),
+                ..
+            } if session == descriptor
+        ));
+
+        send_packet(
+            &replay_client,
+            host.local_addr().unwrap(),
+            &packet(WireMessage::JoinRequest {
+                nonce: fixture_nonce('b'),
+                session_id: Some(descriptor.session_id.clone()),
+                compatibility: contract,
+            }),
+        )
+        .unwrap();
+        assert!(
+            !receive_join(
+                &host,
+                &mut buffer,
+                "127.0.0.1".parse().unwrap(),
+                &args,
+                &descriptor,
+                &mut replay_guard,
+            )
+            .unwrap()
+        );
+        replay_client.set_nonblocking(true).unwrap();
+        assert_eq!(
+            replay_client.recv_from(&mut buffer).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn host_silently_drops_stale_and_off_subnet_join_requests() {
+        let args = loopback_host_args();
+        let contract = compatibility(b"shared-profile");
+        let descriptor =
+            session_descriptor("127.0.0.1".parse().unwrap(), &contract, &args).unwrap();
+        let host = UdpSocket::bind("127.0.0.1:0").expect("bind host fixture");
+        host.set_nonblocking(true).unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").expect("bind client fixture");
+        let mut buffer = [0_u8; MAX_UDP_DATAGRAM_SIZE];
+        let mut replay_guard = ReplayGuard::default();
+
+        let mut stale = packet(WireMessage::JoinRequest {
+            nonce: fixture_nonce('c'),
+            session_id: Some(descriptor.session_id.clone()),
+            compatibility: contract.clone(),
+        });
+        stale.sent_at_ms = now_ms().saturating_sub(HOST_PACKET_MAX_AGE_MS + 1);
+        send_packet(&client, host.local_addr().unwrap(), &stale).unwrap();
+        assert!(
+            !receive_join(
+                &host,
+                &mut buffer,
+                "127.0.0.1".parse().unwrap(),
+                &args,
+                &descriptor,
+                &mut replay_guard,
+            )
+            .unwrap()
+        );
+
+        send_packet(
+            &client,
+            host.local_addr().unwrap(),
+            &packet(WireMessage::JoinRequest {
+                nonce: fixture_nonce('d'),
+                session_id: Some(descriptor.session_id.clone()),
+                compatibility: contract,
+            }),
+        )
+        .unwrap();
+        assert!(
+            !receive_join(
+                &host,
+                &mut buffer,
+                "192.168.1.10".parse().unwrap(),
+                &args,
+                &descriptor,
+                &mut replay_guard,
+            )
+            .unwrap()
+        );
+
+        client.set_nonblocking(true).unwrap();
+        assert_eq!(
+            client.recv_from(&mut buffer).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn private_address_policy_and_subnet_are_strict() {
+        for allowed in ["10.0.0.1", "172.16.0.1", "192.168.1.1", "127.0.0.1"] {
+            assert!(address_allowed(allowed.parse().unwrap()));
+        }
+        assert!(!address_allowed("8.8.8.8".parse().unwrap()));
+        assert!(
+            validate_peer(
+                "192.168.10.22".parse().unwrap(),
+                "192.168.10.4".parse().unwrap(),
+                24,
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_peer(
+                "192.168.11.22".parse().unwrap(),
+                "192.168.10.4".parse().unwrap(),
+                24,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_peer(
+                "8.8.8.8".parse().unwrap(),
+                "8.8.8.1".parse().unwrap(),
+                24,
+                false
+            )
+            .is_err()
+        );
+
+        let mut args = loopback_host_args();
+        args.network.bind = "::".parse().unwrap();
+        assert!(checked_interface(&args.network).is_err());
+        args.network.bind = "127.0.0.1".parse().unwrap();
+        args.network.discovery_port = 0;
+        assert!(checked_interface(&args.network).is_err());
+    }
+
+    #[test]
+    fn compatibility_hash_binds_pinned_runtimes_and_capability_policy() {
+        let runtime = runtime_contract();
+        for required in [
+            LINUX_RUFFLE_ARCHIVE_SHA256,
+            WINDOWS_RUFFLE_ARCHIVE_SHA256,
+            "open-url=deny",
+            "filesystem=allow",
+            "storage=disk",
+        ] {
+            assert!(runtime.contains(required));
+        }
+
+        let contract = compatibility(b"profile");
+        let legacy_session_hash = sha256_bytes(
+            format!(
+                "protocol={PROTOCOL_VERSION};swf={};runtime={};profile={}",
+                contract.swf_sha256, contract.runtime_sha256, contract.profile_sha256
+            )
+            .as_bytes(),
+        );
+        assert_ne!(contract.session_sha256, legacy_session_hash);
+        validate_compatibility(&contract).unwrap();
+    }
+
+    #[test]
+    fn stale_and_future_packets_are_rejected() {
+        let mut old = packet(WireMessage::Probe {
+            nonce: "old".to_owned(),
+        });
+        old.sent_at_ms = now_ms().saturating_sub(10_000);
+        assert!(validate_freshness(&old, 100).is_err());
+
+        let mut future = old;
+        future.sent_at_ms = now_ms().saturating_add(FUTURE_CLOCK_TOLERANCE_MS + 1);
+        assert!(validate_freshness(&future, 100).is_err());
+    }
+
+    #[test]
+    fn profile_hash_is_canonical_and_changes_session_hash() {
+        let first_config: crate::config::ProfileConfig =
+            toml::from_str("[controls.gamepad]\nsouth='j'\n").unwrap();
+        let same_config: crate::config::ProfileConfig =
+            toml::from_str("\n[controls.gamepad]\nsouth = \"j\"\n").unwrap();
+        let changed_config: crate::config::ProfileConfig =
+            toml::from_str("[controls.gamepad]\nsouth='k'\n").unwrap();
+        let first = compatibility(toml::to_string(&first_config).unwrap().as_bytes());
+        let same = compatibility(toml::to_string(&same_config).unwrap().as_bytes());
+        let changed = compatibility(toml::to_string(&changed_config).unwrap().as_bytes());
+        assert_eq!(first, same);
+        assert_ne!(first.profile_sha256, changed.profile_sha256);
+        assert_ne!(first.session_sha256, changed.session_sha256);
+    }
 }

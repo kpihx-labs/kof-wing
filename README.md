@@ -76,15 +76,61 @@ Ruffle as a canonical, percent-encoded `file://` directory URL with a trailing
 slash, so relative Flash loads resolve consistently on Linux and Windows.
 Source manifests and assets remain untouched.
 
-## LAN status
+## Historical 0.1.0 LAN boundary
 
-LAN play is not implemented in 0.1.0. `lan doctor` is a clean module boundary
-that reports UDP bind, FFmpeg, and pinned-runtime capabilities, then explicitly
-reports discovery, input transport, media streaming, reconnect, and security as
-unimplemented. It never claims the LAN release gate is complete.
+The first 0.1.0 launcher slice implemented only `lan doctor`: it reported UDP
+bind, FFmpeg, and pinned-runtime capabilities while discovery, input transport,
+media streaming, reconnect, and security were all unimplemented. The current
+negotiation status is recorded below; the LAN gameplay release gate is still not
+complete.
 
 ## Verification
 
 `make check` runs formatting verification, strict Clippy, all tests, a release
 build, ShellCheck, and pinned local-tool checks. Tests use synthetic fixtures and
 do not require or reproduce proprietary data.
+
+## LAN negotiation slice (current)
+
+The earlier 0.1.0 diagnostic-only status above is superseded by a bounded LAN
+slice: discovery and session negotiation are implemented, but LAN gameplay is
+not. The host is authoritative because Flash/Ruffle lockstep determinism has not
+been established. A successful `join` means only that both peers agreed on the
+compiled protocol, expected audited SWF identity, declared Ruffle runtime policy,
+and canonical profile-configuration hashes. These are declaration contracts,
+not proof that the installed runtime or profile-referenced asset bytes match. It
+does **not** start a game.
+
+```console
+./target/release/kof-wing --profile default lan doctor
+./target/release/kof-wing --profile default lan discover
+./target/release/kof-wing --profile default lan host
+./target/release/kof-wing --profile default lan join
+./target/release/kof-wing --profile default lan join --host 192.168.1.20:27881
+```
+
+`lan host` answers directed same-subnet UDP discovery on port 27880 and strict
+session negotiation on port 27881. `lan join` discovers exactly one compatible
+host unless `--host` is supplied. Every command exposes `--bind`, `--interface`,
+`--prefix-len`, `--discovery-port`, and `--session-port`; host input/media
+metadata ports and discovery timeouts are also configurable. Automatic interface
+selection uses the default IPv4 route, while `--interface` removes ambiguity on
+multi-homed machines. The default prefix is `/24`; pass the real prefix when the
+LAN differs. A concrete `--bind` must equal the selected interface address;
+the wildcard host bind remains the default so directed broadcasts are received.
+
+Private, loopback, or link-local addresses and same-prefix peers are required by
+default. `--allow-public` is an explicit policy override, not port forwarding or
+internet traversal. The launcher uses no cloud, account, relay, UPnP, VPN,
+firewall mutation, or router configuration.
+
+The negotiated client contract contains a remote-player input endpoint and a
+low-latency media endpoint, but these are metadata only. Remote input injection,
+media capture/encoding/streaming, reconnect, and the physical two-PC gameplay
+gate remain unimplemented. FFmpeg availability in `lan doctor` is diagnostic;
+the launcher does not invoke it for LAN media.
+
+Negotiation is compatibility checking, not peer authentication or encryption.
+The private-address and same-prefix policy limits the default scope but does not
+turn an untrusted LAN into a trusted one; authenticated transport remains future
+work alongside the actual input and media paths.

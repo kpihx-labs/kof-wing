@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{cli::PlayArgs, config::Controls, profile::ProfilePaths, source::verify_hash};
 
+pub const RUFFLE_VERSION: &str = "0.7.1";
 pub const LINUX_RUFFLE_ARCHIVE_SHA256: &str =
     "67950dfdde643f9087ae478eb3637fe52e0deefc79bdb55fe43cd69dab9fdd99";
 pub const WINDOWS_RUFFLE_ARCHIVE_SHA256: &str =

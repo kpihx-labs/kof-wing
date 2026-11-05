@@ -1,4 +1,7 @@
-.PHONY: build check doctor push run test
+.PHONY: build check doctor help push run test
+
+help:
+	@echo "Targets: help check doctor run test build push"
 
 check:
 	@cargo fmt --all -- --check

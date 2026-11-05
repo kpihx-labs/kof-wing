@@ -22,15 +22,54 @@ fn run() -> Result<()> {
     let work = default_work_dir()?;
     match cli.command {
         Command::Profile { command } => profile_command(command),
-        Command::Lan {
-            command: LanCommand::Doctor,
-        } => {
-            lan::doctor(&work);
-            Ok(())
-        }
+        Command::Lan { command } => lan_command(command, &cli.profile, &work),
         Command::Doctor => doctor(cli.source.as_deref(), &cli.profile, &work),
         Command::Play(options) => play(cli.source.as_deref(), &cli.profile, &work, &options),
     }
+}
+
+fn lan_command(command: LanCommand, profile_name: &str, work: &Path) -> Result<()> {
+    match command {
+        LanCommand::Doctor(network) => lan::doctor(work, profile_name, &network),
+        LanCommand::Discover(args) => {
+            let sessions = lan::discover(profile_name, &args)?;
+            if sessions.is_empty() {
+                println!("no LAN sessions discovered");
+            }
+            for result in sessions {
+                let status = if result.compatible {
+                    "compatible".to_owned()
+                } else {
+                    result
+                        .incompatibility
+                        .unwrap_or_else(|| "incompatible".to_owned())
+                };
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    result.session.session_id,
+                    result.session.name,
+                    result.session.negotiation_endpoint,
+                    status
+                );
+            }
+        }
+        LanCommand::Host(args) => return lan::host(profile_name, &args),
+        LanCommand::Join(args) => {
+            let session = lan::join(profile_name, &args)?;
+            println!("session negotiation accepted: {}", session.session_id);
+            println!("authoritative host: {}", session.negotiation_endpoint);
+            println!(
+                "remote input endpoint: {} ({:?}; injection not implemented)",
+                session.remote_input.endpoint, session.remote_input.status
+            );
+            println!(
+                "media endpoint: {} ({:?}; capture/streaming not implemented)",
+                session.media.endpoint, session.media.status
+            );
+            println!("LAN gameplay was not started");
+        }
+    }
+    Ok(())
 }
 
 fn profile_command(command: ProfileCommand) -> Result<()> {

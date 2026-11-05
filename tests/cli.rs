@@ -28,7 +28,7 @@ fn doctor_without_source_fails_with_actionable_message() {
 }
 
 #[test]
-fn lan_doctor_is_explicitly_diagnostic_only() {
+fn lan_doctor_reports_negotiation_without_claiming_gameplay() {
     let output = Command::new(env!("CARGO_BIN_EXE_kof-wing"))
         .args(["lan", "doctor"])
         .output()
@@ -36,7 +36,53 @@ fn lan_doctor_is_explicitly_diagnostic_only() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
     assert!(stdout.contains("not implemented"));
-    assert!(stdout.contains("unavailable by design"));
+    assert!(stdout.contains("[implemented] discovery and strict session negotiation"));
+    assert!(!stdout.contains("[ok] discovery and strict session negotiation implemented"));
+    assert!(stdout.contains("gameplay readiness: unavailable"));
+}
+
+#[test]
+fn lan_help_exposes_all_zero_service_commands_and_network_controls() {
+    let binary = env!("CARGO_BIN_EXE_kof-wing");
+    let lan = Command::new(binary)
+        .args(["lan", "--help"])
+        .output()
+        .expect("run LAN help");
+    assert!(lan.status.success());
+    let stdout = String::from_utf8(lan.stdout).expect("UTF-8 LAN help");
+    for command in ["doctor", "discover", "host", "join"] {
+        assert!(stdout.contains(command), "LAN help omitted {command}");
+    }
+
+    for command in ["doctor", "discover", "host", "join"] {
+        let output = Command::new(binary)
+            .args(["lan", command, "--help"])
+            .output()
+            .expect("run LAN command help");
+        assert!(output.status.success(), "{command} help failed");
+        let help = String::from_utf8(output.stdout).expect("UTF-8 command help");
+        for option in [
+            "--bind",
+            "--interface",
+            "--prefix-len",
+            "--discovery-port",
+            "--session-port",
+            "--allow-public",
+        ] {
+            assert!(help.contains(option), "{command} help omitted {option}");
+        }
+    }
+}
+
+#[test]
+fn lan_discovery_rejects_public_interface_by_default() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kof-wing"))
+        .args(["lan", "discover", "--interface", "8.8.8.8"])
+        .output()
+        .expect("run LAN discovery policy check");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
+    assert!(stderr.contains("not private, loopback, or link-local"));
 }
 
 #[test]
