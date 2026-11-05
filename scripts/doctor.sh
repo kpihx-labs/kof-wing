@@ -15,8 +15,12 @@ check_hash() {
 
 check_hash 67950dfdde643f9087ae478eb3637fe52e0deefc79bdb55fe43cd69dab9fdd99 \
     "$ROOT/work/tools/ruffle-0.7.1-linux-x86_64.tar.gz"
+check_hash a5f6df9881771226e330e08a1fa7666f4caff50ddf9f2f993cdd95293edca627 \
+    "$ROOT/work/tools/ruffle-0.7.1-windows-x86_64.zip"
 check_hash 56ce960aeafc7caf034e2052ba49f878a883f7c7ca690da6eeffca9587b5e4b9 \
     "$ROOT/work/tools/ffdec_26.4.0.zip"
+check_hash fd05314b2f3cddaf9c85aa512bc796e6c57d3bca21022b3e9b59bf74f1ce1513 \
+    "$ROOT/work/tools/dump-projector"
 [[ -x "$ROOT/work/tools/ruffle-0.7.1/ruffle" ]]
 [[ -x "$ROOT/work/tools/dump-projector" ]]
 
