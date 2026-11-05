@@ -15,9 +15,20 @@ pub fn default_work_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("KOF_WING_WORK") {
         return Ok(PathBuf::from(path));
     }
-    Ok(std::env::current_dir()
+
+    let current = std::env::current_dir()
         .context("cannot determine the current directory")?
-        .join("work"))
+        .join("work");
+    if current.join("tools").is_dir() {
+        return Ok(current);
+    }
+
+    let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("work");
+    if project.join("tools").is_dir() {
+        return Ok(project);
+    }
+
+    Ok(current)
 }
 
 pub fn require_source(source: Option<&Path>) -> Result<PathBuf> {
