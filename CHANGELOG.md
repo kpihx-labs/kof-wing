@@ -29,3 +29,12 @@
   media-metadata controls without mutating firewall or router state.
 - Keep the LAN contract truthful: the host is authoritative, while remote input
   injection and low-latency media streaming remain explicitly unimplemented.
+- Pin Sunshine 2026.914.233613 and Moonlight 6.2.0 for Linux and Windows, bind
+  their exact archive hashes into protocol-v2 compatibility, and verify them in
+  project checks.
+- Add per-profile `lan setup-host`, explicit HITL `lan pair`, and opt-in
+  `host --transport sunshine` / `join --transport moonlight` without changing
+  the existing negotiation-only defaults.
+- Generate a KOF-only Sunshine app/config with no Desktop, UPnP, broad web UI,
+  global config, or internet binding; isolate Moonlight state and preserve the
+  physical two-PC gameplay gate.

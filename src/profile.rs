@@ -8,10 +8,21 @@ use crate::{APP_NAME, config::ProfileConfig};
 #[derive(Debug, Clone)]
 pub struct ProfilePaths {
     pub name: String,
+    pub config_home: PathBuf,
+    pub data_home: PathBuf,
+    pub cache_home: PathBuf,
     pub config: PathBuf,
     pub ruffle_config: PathBuf,
     pub saves: PathBuf,
     pub cache: PathBuf,
+    pub sunshine_config: PathBuf,
+    pub sunshine_apps: PathBuf,
+    pub sunshine_state: PathBuf,
+    pub sunshine_log: PathBuf,
+    pub moonlight_config_home: PathBuf,
+    pub moonlight_data_home: PathBuf,
+    pub moonlight_cache_home: PathBuf,
+    pub transport_tools: PathBuf,
 }
 
 impl ProfilePaths {
@@ -29,12 +40,27 @@ impl ProfilePaths {
 
     pub fn from_roots(name: &str, config: PathBuf, data: PathBuf, cache: PathBuf) -> Self {
         let config_root = config.join("profiles").join(name);
+        let data_root = data.join("profiles").join(name);
+        let cache_root = cache.join("profiles").join(name);
+        let sunshine_config_root = config_root.join("sunshine");
+        let sunshine_data_root = data_root.join("sunshine");
         Self {
             name: name.to_owned(),
+            config_home: config,
+            data_home: data,
+            cache_home: cache,
             config: config_root.join("config.toml"),
             ruffle_config: config_root.join("ruffle"),
-            saves: data.join("profiles").join(name).join("saves"),
-            cache: cache.join("profiles").join(name),
+            saves: data_root.join("saves"),
+            cache: cache_root.clone(),
+            sunshine_config: sunshine_config_root.join("sunshine.conf"),
+            sunshine_apps: sunshine_config_root.join("apps.json"),
+            sunshine_state: sunshine_data_root.join("sunshine_state.json"),
+            sunshine_log: cache_root.join("sunshine/sunshine.log"),
+            moonlight_config_home: config_root.join("moonlight"),
+            moonlight_data_home: data_root.join("moonlight"),
+            moonlight_cache_home: cache_root.join("moonlight"),
+            transport_tools: data_root.join("transport-tools"),
         }
     }
 

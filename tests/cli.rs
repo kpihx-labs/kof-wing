@@ -35,9 +35,8 @@ fn lan_doctor_reports_negotiation_without_claiming_gameplay() {
         .expect("run LAN doctor");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
-    assert!(stdout.contains("not implemented"));
-    assert!(stdout.contains("[implemented] discovery and strict session negotiation"));
-    assert!(!stdout.contains("[ok] discovery and strict session negotiation implemented"));
+    assert!(stdout.contains("[not verified] physical two-PC gameplay"));
+    assert!(stdout.contains("optional Sunshine/Moonlight transport"));
     assert!(stdout.contains("gameplay readiness: unavailable"));
 }
 
@@ -50,11 +49,11 @@ fn lan_help_exposes_all_zero_service_commands_and_network_controls() {
         .expect("run LAN help");
     assert!(lan.status.success());
     let stdout = String::from_utf8(lan.stdout).expect("UTF-8 LAN help");
-    for command in ["doctor", "discover", "host", "join"] {
+    for command in ["doctor", "setup-host", "discover", "host", "join", "pair"] {
         assert!(stdout.contains(command), "LAN help omitted {command}");
     }
 
-    for command in ["doctor", "discover", "host", "join"] {
+    for command in ["doctor", "discover", "host", "join", "pair"] {
         let output = Command::new(binary)
             .args(["lan", command, "--help"])
             .output()
@@ -72,6 +71,55 @@ fn lan_help_exposes_all_zero_service_commands_and_network_controls() {
             assert!(help.contains(option), "{command} help omitted {option}");
         }
     }
+}
+
+#[test]
+fn transport_flags_and_explicit_pairing_are_documented_by_cli() {
+    let binary = env!("CARGO_BIN_EXE_kof-wing");
+    let host = Command::new(binary)
+        .args(["lan", "host", "--help"])
+        .output()
+        .expect("run host help");
+    let host_help = String::from_utf8(host.stdout).expect("UTF-8 host help");
+    assert!(host_help.contains("--transport"));
+    assert!(host_help.contains("sunshine"));
+
+    let join = Command::new(binary)
+        .args(["lan", "join", "--help"])
+        .output()
+        .expect("run join help");
+    let join_help = String::from_utf8(join.stdout).expect("UTF-8 join help");
+    assert!(join_help.contains("--transport"));
+    assert!(join_help.contains("moonlight"));
+
+    let pair = Command::new(binary)
+        .args(["lan", "pair", "--help"])
+        .output()
+        .expect("run pair help");
+    let pair_help = String::from_utf8(pair.stdout).expect("UTF-8 pair help");
+    assert!(pair_help.contains("one-time Moonlight PIN pairing"));
+    assert!(!pair_help.contains("--pin"));
+}
+
+#[test]
+fn readme_keeps_pairing_hitl_and_physical_gate_truthful() {
+    let readme = include_str!("../README.md");
+    for required in [
+        "lan setup-host",
+        "--transport sunshine",
+        "lan pair",
+        "--transport moonlight",
+        "physical two-PC",
+        "--multi-controller",
+        "--appimage-extract-and-run",
+        "portable.dat",
+        "origin_web_ui_allowed = pc",
+        "non-config state",
+        "saved Moonlight preferences cannot silently change a session",
+    ] {
+        assert!(readme.contains(required), "README omitted {required}");
+    }
+    assert!(readme.contains("not yet proof of full gameplay"));
 }
 
 #[test]

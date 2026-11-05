@@ -28,7 +28,7 @@ pub enum Command {
         #[command(subcommand)]
         command: ProfileCommand,
     },
-    /// Discover and negotiate zero-service same-subnet LAN sessions.
+    /// Discover, negotiate, and opt into pinned same-subnet LAN transport.
     Lan {
         #[command(subcommand)]
         command: LanCommand,
@@ -85,12 +85,34 @@ pub enum ProfileCommand {
 pub enum LanCommand {
     /// Diagnose LAN addressing, UDP binds, compatibility hashes, and capabilities.
     Doctor(LanNetworkArgs),
+    /// Verify pinned Sunshine and generate an isolated host configuration for this profile.
+    SetupHost,
     /// Discover compatible host sessions on the directly connected subnet.
     Discover(LanDiscoveryArgs),
     /// Advertise and negotiate an authoritative-host session.
     Host(LanHostArgs),
-    /// Negotiate with a host; input injection and media transport remain unavailable.
+    /// Negotiate with a host and optionally start pinned Moonlight transport.
     Join(LanJoinArgs),
+    /// Negotiate a host and explicitly start one-time Moonlight PIN pairing.
+    Pair(LanPairArgs),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum HostTransport {
+    /// Keep the existing negotiation-only behavior.
+    #[default]
+    Negotiation,
+    /// Start the pinned Sunshine host before serving negotiation.
+    Sunshine,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum JoinTransport {
+    /// Keep the existing negotiation-only behavior.
+    #[default]
+    Negotiation,
+    /// Stream the negotiated KOF application with pinned Moonlight.
+    Moonlight,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -143,17 +165,21 @@ pub struct LanHostArgs {
     #[arg(long, default_value = "KOF Wing LAN")]
     pub name: String,
 
-    /// Metadata-only UDP endpoint reserved for future remote-input transport.
+    /// Negotiation-only input metadata port (unused by Sunshine transport).
     #[arg(long, default_value_t = 27_882)]
     pub input_port: u16,
 
-    /// Metadata-only UDP endpoint reserved for future low-latency media transport.
+    /// Negotiation-only media metadata port (unused by Sunshine transport).
     #[arg(long, default_value_t = 27_883)]
     pub media_port: u16,
 
     /// Exit after answering one join request (useful for bounded diagnostics).
     #[arg(long)]
     pub once: bool,
+
+    /// Transport to start after compatibility checks.
+    #[arg(long, value_enum, default_value_t)]
+    pub transport: HostTransport,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -162,6 +188,20 @@ pub struct LanJoinArgs {
     pub discovery: LanDiscoveryArgs,
 
     /// Direct negotiation endpoint. Without it, exactly one compatible discovery result is required.
+    #[arg(long)]
+    pub host: Option<SocketAddr>,
+
+    /// Transport to start after successful negotiation.
+    #[arg(long, value_enum, default_value_t)]
+    pub transport: JoinTransport,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct LanPairArgs {
+    #[command(flatten)]
+    pub discovery: LanDiscoveryArgs,
+
+    /// Direct negotiation endpoint. Without it, exactly one compatible host is required.
     #[arg(long)]
     pub host: Option<SocketAddr>,
 }

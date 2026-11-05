@@ -42,10 +42,12 @@
   ports without cloud, accounts, relay, port forwarding, or firewall mutation.
 - [x] Model an authoritative-host session plus honest remote-input and
   low-latency-media endpoint metadata.
-- [ ] Implement remote input capture, transport, and host-side injection.
-- [ ] Implement low-latency host capture, hardware encoding, transport, decode,
-  presentation, jitter handling, and A/V diagnostics.
+- [x] Integrate pinned Sunshine/Moonlight remote input and media transport behind
+  explicit opt-in commands with per-profile state.
+- [ ] Validate host capture, hardware encoding, controller injection, decode,
+  presentation, jitter handling, and A/V diagnostics on supported physical PCs.
 - [ ] Implement reconnect/session resumption and complete-match failure handling.
-- [ ] Add authenticated and encrypted peer transport before use on untrusted LANs.
+- [x] Require explicit Sunshine PIN pairing and mandatory encrypted LAN streams.
+- [ ] Authenticate the launcher negotiation channel before use on untrusted LANs.
 - [ ] Pass the two-physical-PC Ubuntu/Windows release gate before describing LAN
   gameplay as available.

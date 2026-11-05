@@ -22,15 +22,33 @@ fn run() -> Result<()> {
     let work = default_work_dir()?;
     match cli.command {
         Command::Profile { command } => profile_command(command),
-        Command::Lan { command } => lan_command(command, &cli.profile, &work),
+        Command::Lan { command } => {
+            lan_command(command, cli.source.as_deref(), &cli.profile, &work)
+        }
         Command::Doctor => doctor(cli.source.as_deref(), &cli.profile, &work),
         Command::Play(options) => play(cli.source.as_deref(), &cli.profile, &work, &options),
     }
 }
 
-fn lan_command(command: LanCommand, profile_name: &str, work: &Path) -> Result<()> {
+fn lan_command(
+    command: LanCommand,
+    source_path: Option<&Path>,
+    profile_name: &str,
+    work: &Path,
+) -> Result<()> {
     match command {
         LanCommand::Doctor(network) => lan::doctor(work, profile_name, &network),
+        LanCommand::SetupHost => {
+            let source = require_source(source_path)?;
+            let launcher = std::env::current_exe().context("cannot locate kof-wing executable")?;
+            let paths = kof_wing::transport::setup_host(work, profile_name, &source, &launcher)?;
+            println!(
+                "generated isolated Sunshine config: {}",
+                paths.config.display()
+            );
+            println!("generated KOF-only Sunshine apps: {}", paths.apps.display());
+            println!("Desktop is not exposed; UPnP is disabled; remote web UI access is denied");
+        }
         LanCommand::Discover(args) => {
             let sessions = lan::discover(profile_name, &args)?;
             if sessions.is_empty() {
@@ -53,20 +71,43 @@ fn lan_command(command: LanCommand, profile_name: &str, work: &Path) -> Result<(
                 );
             }
         }
-        LanCommand::Host(args) => return lan::host(profile_name, &args),
+        LanCommand::Host(args) => return lan::host(work, profile_name, &args),
         LanCommand::Join(args) => {
             let session = lan::join(profile_name, &args)?;
             println!("session negotiation accepted: {}", session.session_id);
             println!("authoritative host: {}", session.negotiation_endpoint);
             println!(
-                "remote input endpoint: {} ({:?}; injection not implemented)",
+                "remote input endpoint: {} ({:?})",
                 session.remote_input.endpoint, session.remote_input.status
             );
             println!(
-                "media endpoint: {} ({:?}; capture/streaming not implemented)",
+                "media endpoint: {} ({:?})",
                 session.media.endpoint, session.media.status
             );
-            println!("LAN gameplay was not started");
+            if args.transport == kof_wing::cli::JoinTransport::Moonlight {
+                kof_wing::transport::stream_client(
+                    work,
+                    profile_name,
+                    session.negotiation_endpoint.ip(),
+                )?;
+            } else {
+                println!("LAN gameplay was not started");
+            }
+        }
+        LanCommand::Pair(args) => {
+            let join = kof_wing::cli::LanJoinArgs {
+                discovery: args.discovery,
+                host: args.host,
+                transport: kof_wing::cli::JoinTransport::Moonlight,
+            };
+            let session = lan::join(profile_name, &join)?;
+            println!("one-time pairing requires a person at the Sunshine host terminal");
+            println!("enter the Moonlight PIN there; pairing is never automatic");
+            kof_wing::transport::pair_client(
+                work,
+                profile_name,
+                session.negotiation_endpoint.ip(),
+            )?;
         }
     }
     Ok(())

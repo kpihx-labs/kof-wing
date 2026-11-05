@@ -13,15 +13,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    cli::{LanDiscoveryArgs, LanHostArgs, LanJoinArgs, LanNetworkArgs},
+    cli::{
+        HostTransport, JoinTransport, LanDiscoveryArgs, LanHostArgs, LanJoinArgs, LanNetworkArgs,
+    },
     profile::ProfilePaths,
     runtime::{
         self, LINUX_RUFFLE_ARCHIVE_SHA256, Platform, RUFFLE_VERSION, WINDOWS_RUFFLE_ARCHIVE_SHA256,
     },
     source::SWF_SHA256,
+    transport,
 };
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 const WIRE_MAGIC: &str = "kof-wing-lan";
 const MAX_PACKET_SIZE: usize = 8_192;
 const MAX_UDP_DATAGRAM_SIZE: usize = 65_535;
@@ -37,6 +40,7 @@ pub struct Compatibility {
     pub swf_sha256: String,
     pub runtime_sha256: String,
     pub profile_sha256: String,
+    pub transport_sha256: String,
     pub session_sha256: String,
 }
 
@@ -52,6 +56,7 @@ pub struct EndpointMetadata {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CapabilityStatus {
+    Available,
     MetadataOnly,
     NotImplemented,
 }
@@ -190,6 +195,10 @@ pub fn doctor(work: &Path, profile_name: &str, network: &LanNetworkArgs) {
         Ok(path) => println!("  [ok] pinned host runtime: {}", path.display()),
         Err(error) => println!("  [missing] pinned host runtime: {error:#}"),
     }
+    match transport::verify_archives(work) {
+        Ok(()) => println!("  [ok] pinned Sunshine/Moonlight transport archives"),
+        Err(error) => println!("  [missing] pinned transport archives: {error:#}"),
+    }
     if let Some(IpAddr::V4(interface)) = interface {
         match directed_broadcast(interface, network.prefix_len) {
             Ok(address) => println!(
@@ -199,9 +208,9 @@ pub fn doctor(work: &Path, profile_name: &str, network: &LanNetworkArgs) {
             Err(error) => println!("  [missing] discovery broadcast: {error:#}"),
         }
     }
-    println!("  [implemented] discovery and strict session negotiation");
-    println!("  [not implemented] remote input injection, media capture/streaming, reconnect");
-    println!("LAN gameplay readiness: unavailable until transports and the two-PC gate pass");
+    println!("  [implemented] discovery, negotiation, and optional Sunshine/Moonlight transport");
+    println!("  [not verified] physical two-PC gameplay and reconnect behavior");
+    println!("LAN gameplay readiness: unavailable until the physical two-PC gate passes");
 }
 
 pub fn discover(profile_name: &str, args: &LanDiscoveryArgs) -> Result<Vec<DiscoveredSession>> {
@@ -210,17 +219,30 @@ pub fn discover(profile_name: &str, args: &LanDiscoveryArgs) -> Result<Vec<Disco
     discover_with_contract(interface, &local, args)
 }
 
-pub fn host(profile_name: &str, args: &LanHostArgs) -> Result<()> {
+pub fn host(work: &Path, profile_name: &str, args: &LanHostArgs) -> Result<()> {
     ensure!(
         !args.name.trim().is_empty() && args.name.trim().len() <= 64,
         "session name must be 1-64 bytes"
     );
+    ensure!(
+        !(args.once && args.transport == HostTransport::Sunshine),
+        "--once is negotiation-only and cannot be combined with --transport sunshine"
+    );
     ensure_distinct_ports(args)?;
     let interface = checked_interface(&args.network)?;
+    ensure!(
+        args.transport != HostTransport::Sunshine || address_allowed(interface.into()),
+        "Sunshine transport cannot use --allow-public; select a private, loopback, or link-local interface"
+    );
     let compatibility = local_compatibility(profile_name)?;
     let descriptor = session_descriptor(interface, &compatibility, args)?;
     let discovery = bind_socket(args.network.bind, args.network.discovery_port, "discovery")?;
     let negotiation = bind_socket(args.network.bind, args.network.session_port, "negotiation")?;
+    let _transport = if args.transport == HostTransport::Sunshine {
+        Some(transport::start_host(work, profile_name, interface.into())?)
+    } else {
+        None
+    };
     discovery.set_nonblocking(true)?;
     negotiation.set_nonblocking(true)?;
 
@@ -228,8 +250,11 @@ pub fn host(profile_name: &str, args: &LanHostArgs) -> Result<()> {
     println!("discovery: {}:{}", interface, args.network.discovery_port);
     println!("negotiation: {}", descriptor.negotiation_endpoint);
     println!("session contract SHA-256: {}", compatibility.session_sha256);
-    println!("remote input endpoint is metadata only; injection is not implemented");
-    println!("media endpoint is metadata only; capture/streaming is not implemented");
+    if args.transport == HostTransport::Sunshine {
+        println!("pinned Sunshine transport started; enter the one-time Moonlight PIN here");
+    } else {
+        println!("remote input/media transport not started (use --transport sunshine)");
+    }
 
     let mut buffer = [0_u8; MAX_UDP_DATAGRAM_SIZE];
     let mut replay_guard = ReplayGuard::default();
@@ -255,6 +280,10 @@ pub fn host(profile_name: &str, args: &LanHostArgs) -> Result<()> {
 
 pub fn join(profile_name: &str, args: &LanJoinArgs) -> Result<SessionDescriptor> {
     let interface = checked_interface(&args.discovery.network)?;
+    ensure!(
+        args.transport != JoinTransport::Moonlight || address_allowed(interface.into()),
+        "Moonlight transport cannot use --allow-public; select a private, loopback, or link-local interface"
+    );
     let local = local_compatibility(profile_name)?;
     let (endpoint, expected_session_id) = if let Some(endpoint) = args.host {
         ensure!(
@@ -283,13 +312,18 @@ pub fn join(profile_name: &str, args: &LanJoinArgs) -> Result<SessionDescriptor>
             Some(compatible[0].session.session_id.clone()),
         )
     };
-    negotiate(
+    let session = negotiate(
         interface,
         endpoint,
         expected_session_id.as_deref(),
         &local,
         args,
-    )
+    )?;
+    ensure!(
+        args.transport != JoinTransport::Moonlight || descriptor_has_sunshine(&session),
+        "host negotiated successfully but did not advertise Sunshine transport"
+    );
+    Ok(session)
 }
 
 pub fn local_compatibility(profile_name: &str) -> Result<Compatibility> {
@@ -303,11 +337,18 @@ pub fn local_compatibility(profile_name: &str) -> Result<Compatibility> {
 fn compatibility_from_profile(profile: &[u8]) -> Compatibility {
     let runtime_sha256 = sha256_bytes(runtime_contract().as_bytes());
     let profile_sha256 = sha256_bytes(profile);
-    let session_sha256 = session_contract_hash(SWF_SHA256, &runtime_sha256, &profile_sha256);
+    let transport_sha256 = sha256_bytes(transport::contract().as_bytes());
+    let session_sha256 = session_contract_hash(
+        SWF_SHA256,
+        &runtime_sha256,
+        &profile_sha256,
+        &transport_sha256,
+    );
     Compatibility {
         swf_sha256: SWF_SHA256.to_owned(),
         runtime_sha256,
         profile_sha256,
+        transport_sha256,
         session_sha256,
     }
 }
@@ -329,19 +370,47 @@ fn session_descriptor(
         negotiation_endpoint: SocketAddr::new(interface.into(), args.network.session_port),
         compatibility: compatibility.clone(),
         authoritative_host: true,
-        remote_input: EndpointMetadata {
-            endpoint: SocketAddr::new(interface.into(), args.input_port),
-            transport: "udp".to_owned(),
-            format: "remote-player-input-v1".to_owned(),
-            status: CapabilityStatus::NotImplemented,
+        remote_input: if args.transport == HostTransport::Sunshine {
+            transport_endpoint(interface)
+        } else {
+            EndpointMetadata {
+                endpoint: SocketAddr::new(interface.into(), args.input_port),
+                transport: "udp".to_owned(),
+                format: "remote-player-input-v1".to_owned(),
+                status: CapabilityStatus::NotImplemented,
+            }
         },
-        media: EndpointMetadata {
-            endpoint: SocketAddr::new(interface.into(), args.media_port),
-            transport: "udp".to_owned(),
-            format: "low-latency-media-unselected".to_owned(),
-            status: CapabilityStatus::MetadataOnly,
+        media: if args.transport == HostTransport::Sunshine {
+            transport_endpoint(interface)
+        } else {
+            EndpointMetadata {
+                endpoint: SocketAddr::new(interface.into(), args.media_port),
+                transport: "udp".to_owned(),
+                format: "low-latency-media-unselected".to_owned(),
+                status: CapabilityStatus::MetadataOnly,
+            }
         },
     })
+}
+
+fn transport_endpoint(interface: Ipv4Addr) -> EndpointMetadata {
+    EndpointMetadata {
+        endpoint: SocketAddr::new(interface.into(), transport::SUNSHINE_PORT),
+        transport: "sunshine/moonlight".to_owned(),
+        format: format!(
+            "sunshine-{}+moonlight-{}",
+            transport::SUNSHINE_VERSION,
+            transport::MOONLIGHT_VERSION
+        ),
+        status: CapabilityStatus::Available,
+    }
+}
+
+fn descriptor_has_sunshine(session: &SessionDescriptor) -> bool {
+    session.remote_input.status == CapabilityStatus::Available
+        && session.media.status == CapabilityStatus::Available
+        && session.remote_input.transport == "sunshine/moonlight"
+        && session.media.transport == "sunshine/moonlight"
 }
 
 fn discover_with_contract(
@@ -710,22 +779,28 @@ fn validate_descriptor(session: &SessionDescriptor) -> Result<()> {
             && session.media.endpoint.ip() == session.negotiation_endpoint.ip(),
         "session endpoint addresses disagree"
     );
-    ensure!(
-        session.remote_input.status == CapabilityStatus::NotImplemented,
-        "unsupported remote-input capability claim"
+    let negotiation_only = session.remote_input.status == CapabilityStatus::NotImplemented
+        && session.media.status == CapabilityStatus::MetadataOnly
+        && session.remote_input.transport == "udp"
+        && session.remote_input.format == "remote-player-input-v1"
+        && session.media.transport == "udp"
+        && session.media.format == "low-latency-media-unselected";
+    let transport_format = format!(
+        "sunshine-{}+moonlight-{}",
+        transport::SUNSHINE_VERSION,
+        transport::MOONLIGHT_VERSION
     );
+    let sunshine = session.remote_input.status == CapabilityStatus::Available
+        && session.media.status == CapabilityStatus::Available
+        && session.remote_input.endpoint.port() == transport::SUNSHINE_PORT
+        && session.media.endpoint.port() == transport::SUNSHINE_PORT
+        && session.remote_input.transport == "sunshine/moonlight"
+        && session.media.transport == "sunshine/moonlight"
+        && session.remote_input.format == transport_format
+        && session.media.format == transport_format;
     ensure!(
-        session.media.status == CapabilityStatus::MetadataOnly,
-        "unsupported media capability claim"
-    );
-    ensure!(
-        session.remote_input.transport == "udp"
-            && session.remote_input.format == "remote-player-input-v1",
-        "unsupported remote-input endpoint contract"
-    );
-    ensure!(
-        session.media.transport == "udp" && session.media.format == "low-latency-media-unselected",
-        "unsupported media endpoint contract"
+        negotiation_only || sunshine,
+        "unsupported input/media endpoint contract"
     );
     Ok(())
 }
@@ -735,6 +810,7 @@ fn validate_compatibility(contract: &Compatibility) -> Result<()> {
         ("SWF", contract.swf_sha256.as_str()),
         ("runtime", contract.runtime_sha256.as_str()),
         ("profile", contract.profile_sha256.as_str()),
+        ("transport", contract.transport_sha256.as_str()),
         ("session", contract.session_sha256.as_str()),
     ] {
         ensure!(
@@ -749,6 +825,7 @@ fn validate_compatibility(contract: &Compatibility) -> Result<()> {
         &contract.swf_sha256,
         &contract.runtime_sha256,
         &contract.profile_sha256,
+        &contract.transport_sha256,
     );
     ensure!(
         contract.session_sha256 == expected_session,
@@ -757,10 +834,10 @@ fn validate_compatibility(contract: &Compatibility) -> Result<()> {
     Ok(())
 }
 
-fn session_contract_hash(swf: &str, runtime: &str, profile: &str) -> String {
+fn session_contract_hash(swf: &str, runtime: &str, profile: &str, transport: &str) -> String {
     sha256_bytes(
         format!(
-            "protocol={PROTOCOL_VERSION};swf={swf};runtime={runtime};profile={profile};authority=host;input=not-implemented;media=metadata-only;reconnect=not-implemented"
+            "protocol={PROTOCOL_VERSION};swf={swf};runtime={runtime};profile={profile};transport={transport};authority=host;input=sunshine;media=sunshine;reconnect=transport-managed"
         )
         .as_bytes(),
     )
@@ -776,6 +853,9 @@ fn compatibility_difference(expected: &Compatibility, actual: &Compatibility) ->
     }
     if expected.profile_sha256 != actual.profile_sha256 {
         differences.push("profile hash");
+    }
+    if expected.transport_sha256 != actual.transport_sha256 {
+        differences.push("transport hash");
     }
     if expected.session_sha256 != actual.session_sha256 {
         differences.push("session hash");
@@ -979,6 +1059,7 @@ mod tests {
             input_port: 27_882,
             media_port: 27_883,
             once: true,
+            transport: HostTransport::Negotiation,
         }
     }
 
@@ -1056,6 +1137,14 @@ mod tests {
             compatibility_difference(&expected, &actual)
                 .expect("SWF mismatch")
                 .contains("SWF hash")
+        );
+
+        actual = expected.clone();
+        actual.transport_sha256 = "different".to_owned();
+        assert!(
+            compatibility_difference(&expected, &actual)
+                .expect("transport mismatch")
+                .contains("transport hash")
         );
 
         actual = expected.clone();
@@ -1365,6 +1454,33 @@ mod tests {
         );
         assert_ne!(contract.session_sha256, legacy_session_hash);
         validate_compatibility(&contract).unwrap();
+    }
+
+    #[test]
+    fn sunshine_descriptor_is_an_exact_supported_transport_contract() {
+        let mut args = loopback_host_args();
+        args.transport = HostTransport::Sunshine;
+        args.once = false;
+        let descriptor = session_descriptor(Ipv4Addr::LOCALHOST, &compatibility(b"profile"), &args)
+            .expect("Sunshine descriptor");
+        validate_descriptor(&descriptor).expect("supported descriptor");
+        assert_eq!(
+            descriptor.remote_input.endpoint.port(),
+            transport::SUNSHINE_PORT
+        );
+        assert_eq!(descriptor.media.status, CapabilityStatus::Available);
+        assert!(descriptor_has_sunshine(&descriptor));
+    }
+
+    #[test]
+    fn moonlight_transport_rejects_negotiation_only_descriptor() {
+        let descriptor = session_descriptor(
+            Ipv4Addr::LOCALHOST,
+            &compatibility(b"profile"),
+            &loopback_host_args(),
+        )
+        .expect("negotiation descriptor");
+        assert!(!descriptor_has_sunshine(&descriptor));
     }
 
     #[test]

@@ -90,16 +90,19 @@ complete.
 build, ShellCheck, and pinned local-tool checks. Tests use synthetic fixtures and
 do not require or reproduce proprietary data.
 
-## LAN negotiation slice (current)
+## LAN transport (current)
 
 The earlier 0.1.0 diagnostic-only status above is superseded by a bounded LAN
-slice: discovery and session negotiation are implemented, but LAN gameplay is
-not. The host is authoritative because Flash/Ruffle lockstep determinism has not
-been established. A successful `join` means only that both peers agreed on the
-compiled protocol, expected audited SWF identity, declared Ruffle runtime policy,
-and canonical profile-configuration hashes. These are declaration contracts,
-not proof that the installed runtime or profile-referenced asset bytes match. It
-does **not** start a game.
+slice: discovery and session negotiation are implemented, and the launcher can
+invoke pinned Sunshine/Moonlight binaries for host-authoritative video, audio,
+and remote controller input. This integration is not a claim that capture or
+input works on any particular machine. Flash/Ruffle lockstep determinism is
+still not assumed.
+Compatibility now binds the protocol, audited SWF, Ruffle policy, canonical
+profile configuration, Sunshine/Moonlight versions, all four pinned archive
+hashes, app name, resolution, frame rate, bitrate, display mode, audio layout,
+multi-controller, game-optimization, frame-pacing, codec, quit-after, explicit
+PIN/stdin policy, encryption, UPnP, web-origin, and private-interface policies.
 
 ```console
 ./target/release/kof-wing --profile default lan doctor
@@ -107,6 +110,24 @@ does **not** start a game.
 ./target/release/kof-wing --profile default lan host
 ./target/release/kof-wing --profile default lan join
 ./target/release/kof-wing --profile default lan join --host 192.168.1.20:27881
+```
+
+Those existing commands retain negotiation-only behavior. A transport session
+is an explicit sequence:
+
+```console
+# Host, once per profile. Run the release binary so apps.json records it.
+./target/release/kof-wing --source "/path/to/KOF Wing EX 1.0" --profile default lan setup-host
+
+# Host, each session. Use the host's private address, not 0.0.0.0.
+./target/release/kof-wing --profile default lan host --interface 192.168.1.20 --transport sunshine
+
+# Client, once per host. Moonlight displays a one-time PIN; a person must type
+# that PIN into the running host terminal. There is no --pin automation.
+./target/release/kof-wing --profile default lan pair --interface 192.168.1.21 --host 192.168.1.20:27881
+
+# Client, after pairing.
+./target/release/kof-wing --profile default lan join --interface 192.168.1.21 --host 192.168.1.20:27881 --transport moonlight
 ```
 
 `lan host` answers directed same-subnet UDP discovery on port 27880 and strict
@@ -124,13 +145,47 @@ default. `--allow-public` is an explicit policy override, not port forwarding or
 internet traversal. The launcher uses no cloud, account, relay, UPnP, VPN,
 firewall mutation, or router configuration.
 
-The negotiated client contract contains a remote-player input endpoint and a
-low-latency media endpoint, but these are metadata only. Remote input injection,
-media capture/encoding/streaming, reconnect, and the physical two-PC gameplay
-gate remain unimplemented. FFmpeg availability in `lan doctor` is diagnostic;
-the launcher does not invoke it for LAN media.
+With `--transport sunshine`, the negotiated input and media endpoint is the
+pinned Sunshine host. With `--transport moonlight`, the client invokes pinned
+Moonlight 6.2.0 as `stream --720 --fps 60 --bitrate 10000 --display-mode
+fullscreen --audio-config stereo --multi-controller ... <negotiated-host> "KOF
+Wing EX 1.0"`. The full fixed argument contract also pins packet size, V-Sync,
+host audio off, game optimization, frame pacing, H.264/automatic decode,
+quit-after, input/window behavior, HDR/YUV 4:4:4 off, and system-key capture so
+saved Moonlight preferences cannot silently change a session. Linux AppImages
+are always launched through
+`--appimage-extract-and-run`. Moonlight receives per-profile `XDG_CONFIG_HOME`,
+`XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `TMPDIR` (Moonlight writes Linux logs to
+the temporary directory); Windows portable tools are extracted into that
+profile's data directory and run there so `portable.dat` keeps settings, pairing
+state, logs, and caches beside the profile-local executable. No global Moonlight
+or Sunshine state is used.
 
-Negotiation is compatibility checking, not peer authentication or encryption.
-The private-address and same-prefix policy limits the default scope but does not
-turn an untrusted LAN into a trusted one; authenticated transport remains future
-work alongside the actual input and media paths.
+`lan setup-host` writes one per-profile Sunshine config and an `apps.json` with
+exactly one application: `KOF Wing EX 1.0`, pointing to the selected source,
+profile, and current `kof-wing` executable. It never adds Desktop. Sunshine is
+bound at launch to the negotiated private interface, UPnP is disabled, and
+`origin_web_ui_allowed = pc` denies remote web UI requests even though all
+Sunshine protocols share that interface bind. LAN stream encryption is
+mandatory. On Linux the launcher also redirects Sunshine's XDG appdata so
+non-config state such as display persistence stays inside the profile; generated
+app environment entries restore the launcher's normal profile roots for KOF.
+On Windows, Sunshine's executable-relative `config` directory remains below the
+profile-local extraction. The launcher does not install services, mutate the
+firewall, configure a router, or expose an internet transport.
+
+### Pinned LAN tools
+
+| Tool | SHA-256 |
+|---|---|
+| `Sunshine_2026.914.233613_x86_64.AppImage` | `6f80297a853bcf8cda114ff131b5c0a8c9a4d96a2a9c3dee1f04c39c54206846` |
+| `Sunshine-Windows-AMD64-lite.zip` | `233008e46f4c0e501a586cbfd6c4fd4a4c0d414a0b5fc7f13c070eb92ec3824b` |
+| `Moonlight-6.2.0-x86_64.AppImage` | `787b0dcbd42ae90620e76fb8d77d7c441ba6473a91c2d7fc3a0fc2466f992437` |
+| `MoonlightPortable-x64-6.2.0.zip` | `6f91d268b41ed5ca8066d9d7578dc403b8db190991ff48f00b1700465f8f7ebf` |
+
+Negotiation itself is compatibility checking, not peer authentication. Sunshine
+pairing and mandatory LAN encryption protect the selected transport only after
+the explicit one-time PIN ceremony. A successful negotiation, pairing, or local
+process launch is not yet proof of full gameplay: controller mapping, host input
+permissions/drivers, capture/encoding, latency, audio, reconnect, and simultaneous
+two-player behavior still require the physical two-PC release gate.

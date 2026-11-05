@@ -4,6 +4,7 @@ pub mod lan;
 pub mod profile;
 pub mod runtime;
 pub mod source;
+pub mod transport;
 
 use std::path::{Path, PathBuf};
 
