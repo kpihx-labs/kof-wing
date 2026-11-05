@@ -135,9 +135,14 @@ session negotiation on port 27881. `lan join` discovers exactly one compatible
 host unless `--host` is supplied. Every command exposes `--bind`, `--interface`,
 `--prefix-len`, `--discovery-port`, and `--session-port`; host input/media
 metadata ports and discovery timeouts are also configurable. Automatic interface
-selection uses the default IPv4 route, while `--interface` removes ambiguity on
-multi-homed machines. The default prefix is `/24`; pass the real prefix when the
-LAN differs. A concrete `--bind` must equal the selected interface address;
+selection uses only the active default IPv4 route and verifies that address
+against OS interface metadata. The selected interface's real netmask, prefix,
+and broadcast are authoritative. `--prefix-len` is an optional assertion and is
+rejected when it differs from the OS prefix; it never invents a subnet. A `/32`,
+point-to-point, inactive, nonexistent, or non-broadcast interface fails with an
+actionable error instead of falling back to a Docker, virtual bridge, or tunnel.
+Explicit loopback remains available to `lan doctor` only. A concrete `--bind`
+must equal the selected interface address;
 the wildcard host bind remains the default so directed broadcasts are received.
 
 Private, loopback, or link-local addresses and same-prefix peers are required by

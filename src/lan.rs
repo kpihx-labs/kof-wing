@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use if_addrs::IfAddr;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -117,6 +118,27 @@ struct ReplayGuard {
     seen: BTreeMap<String, u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalIpv4Interface {
+    name: String,
+    address: Ipv4Addr,
+    netmask: Ipv4Addr,
+    prefix_len: u8,
+    broadcast: Option<Ipv4Addr>,
+    is_loopback: bool,
+    is_oper_up: bool,
+    is_point_to_point: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedInterface {
+    name: String,
+    address: Ipv4Addr,
+    prefix_len: u8,
+    broadcast: Option<Ipv4Addr>,
+    is_loopback: bool,
+}
+
 impl ReplayGuard {
     fn accept(&mut self, nonce: &str) -> bool {
         self.accept_at(nonce, now_ms())
@@ -135,9 +157,17 @@ impl ReplayGuard {
 
 pub fn doctor(work: &Path, profile_name: &str, network: &LanNetworkArgs) {
     println!("LAN zero-service diagnostics:");
-    let interface = match resolve_interface(network.interface) {
+    let interface = match resolve_interface(network.interface, network.prefix_len) {
         Ok(interface) => {
-            report_address("interface", interface, network.allow_public);
+            report_address(
+                "interface",
+                IpAddr::V4(interface.address),
+                network.allow_public,
+            );
+            println!(
+                "  [ok] interface metadata: {} {}/{}",
+                interface.name, interface.address, interface.prefix_len
+            );
             Some(interface)
         }
         Err(error) => {
@@ -199,13 +229,16 @@ pub fn doctor(work: &Path, profile_name: &str, network: &LanNetworkArgs) {
         Ok(()) => println!("  [ok] pinned Sunshine/Moonlight transport archives"),
         Err(error) => println!("  [missing] pinned transport archives: {error:#}"),
     }
-    if let Some(IpAddr::V4(interface)) = interface {
-        match directed_broadcast(interface, network.prefix_len) {
-            Ok(address) => println!(
+    if let Some(interface) = interface {
+        match interface.broadcast {
+            Some(address) => println!(
                 "  [ok] /{} directed discovery broadcast: {address}:{}",
-                network.prefix_len, network.discovery_port
+                interface.prefix_len, network.discovery_port
             ),
-            Err(error) => println!("  [missing] discovery broadcast: {error:#}"),
+            None => println!(
+                "  [missing] discovery broadcast: interface {} has no broadcast address",
+                interface.name
+            ),
         }
     }
     println!("  [implemented] discovery, negotiation, and optional Sunshine/Moonlight transport");
@@ -216,7 +249,7 @@ pub fn doctor(work: &Path, profile_name: &str, network: &LanNetworkArgs) {
 pub fn discover(profile_name: &str, args: &LanDiscoveryArgs) -> Result<Vec<DiscoveredSession>> {
     let interface = checked_interface(&args.network)?;
     let local = local_compatibility(profile_name)?;
-    discover_with_contract(interface, &local, args)
+    discover_with_contract(&interface, &local, args)
 }
 
 pub fn host(work: &Path, profile_name: &str, args: &LanHostArgs) -> Result<()> {
@@ -231,15 +264,19 @@ pub fn host(work: &Path, profile_name: &str, args: &LanHostArgs) -> Result<()> {
     ensure_distinct_ports(args)?;
     let interface = checked_interface(&args.network)?;
     ensure!(
-        args.transport != HostTransport::Sunshine || address_allowed(interface.into()),
+        args.transport != HostTransport::Sunshine || address_allowed(interface.address.into()),
         "Sunshine transport cannot use --allow-public; select a private, loopback, or link-local interface"
     );
     let compatibility = local_compatibility(profile_name)?;
-    let descriptor = session_descriptor(interface, &compatibility, args)?;
+    let descriptor = session_descriptor(interface.address, &compatibility, args)?;
     let discovery = bind_socket(args.network.bind, args.network.discovery_port, "discovery")?;
     let negotiation = bind_socket(args.network.bind, args.network.session_port, "negotiation")?;
     let _transport = if args.transport == HostTransport::Sunshine {
-        Some(transport::start_host(work, profile_name, interface.into())?)
+        Some(transport::start_host(
+            work,
+            profile_name,
+            interface.address.into(),
+        )?)
     } else {
         None
     };
@@ -247,7 +284,10 @@ pub fn host(work: &Path, profile_name: &str, args: &LanHostArgs) -> Result<()> {
     negotiation.set_nonblocking(true)?;
 
     println!("authoritative host session: {}", descriptor.session_id);
-    println!("discovery: {}:{}", interface, args.network.discovery_port);
+    println!(
+        "discovery: {}:{} ({}/{})",
+        interface.address, args.network.discovery_port, interface.name, interface.prefix_len
+    );
     println!("negotiation: {}", descriptor.negotiation_endpoint);
     println!("session contract SHA-256: {}", compatibility.session_sha256);
     if args.transport == HostTransport::Sunshine {
@@ -259,13 +299,21 @@ pub fn host(work: &Path, profile_name: &str, args: &LanHostArgs) -> Result<()> {
     let mut buffer = [0_u8; MAX_UDP_DATAGRAM_SIZE];
     let mut replay_guard = ReplayGuard::default();
     loop {
-        if let Err(error) = receive_probe(&discovery, &mut buffer, interface, args, &descriptor) {
+        if let Err(error) = receive_probe(
+            &discovery,
+            &mut buffer,
+            interface.address,
+            interface.prefix_len,
+            args,
+            &descriptor,
+        ) {
             eprintln!("ignored discovery request error: {error:#}");
         }
         match receive_join(
             &negotiation,
             &mut buffer,
-            interface,
+            interface.address,
+            interface.prefix_len,
             args,
             &descriptor,
             &mut replay_guard,
@@ -281,7 +329,7 @@ pub fn host(work: &Path, profile_name: &str, args: &LanHostArgs) -> Result<()> {
 pub fn join(profile_name: &str, args: &LanJoinArgs) -> Result<SessionDescriptor> {
     let interface = checked_interface(&args.discovery.network)?;
     ensure!(
-        args.transport != JoinTransport::Moonlight || address_allowed(interface.into()),
+        args.transport != JoinTransport::Moonlight || address_allowed(interface.address.into()),
         "Moonlight transport cannot use --allow-public; select a private, loopback, or link-local interface"
     );
     let local = local_compatibility(profile_name)?;
@@ -292,13 +340,13 @@ pub fn join(profile_name: &str, args: &LanJoinArgs) -> Result<SessionDescriptor>
         );
         validate_peer(
             endpoint.ip(),
-            interface,
-            args.discovery.network.prefix_len,
+            interface.address,
+            interface.prefix_len,
             args.discovery.network.allow_public,
         )?;
         (endpoint, None)
     } else {
-        let compatible: Vec<_> = discover_with_contract(interface, &local, &args.discovery)?
+        let compatible: Vec<_> = discover_with_contract(&interface, &local, &args.discovery)?
             .into_iter()
             .filter(|result| result.compatible)
             .collect();
@@ -313,7 +361,8 @@ pub fn join(profile_name: &str, args: &LanJoinArgs) -> Result<SessionDescriptor>
         )
     };
     let session = negotiate(
-        interface,
+        interface.address,
+        interface.prefix_len,
         endpoint,
         expected_session_id.as_deref(),
         &local,
@@ -414,11 +463,11 @@ fn descriptor_has_sunshine(session: &SessionDescriptor) -> bool {
 }
 
 fn discover_with_contract(
-    interface: Ipv4Addr,
+    interface: &ResolvedInterface,
     local: &Compatibility,
     args: &LanDiscoveryArgs,
 ) -> Result<Vec<DiscoveredSession>> {
-    let client_bind = client_bind_address(args.network.bind, interface)?;
+    let client_bind = client_bind_address(args.network.bind, interface.address)?;
     let socket = UdpSocket::bind(SocketAddr::new(client_bind, 0))
         .with_context(|| format!("cannot bind discovery client to {client_bind}:0"))?;
     socket.set_broadcast(true)?;
@@ -429,7 +478,10 @@ fn discover_with_contract(
         nonce: nonce.clone(),
     });
     let target = SocketAddr::new(
-        directed_broadcast(interface, args.network.prefix_len)?.into(),
+        interface
+            .broadcast
+            .context("selected interface has no directed broadcast address")?
+            .into(),
         args.network.discovery_port,
     );
     send_packet(&socket, target, &probe)?;
@@ -460,8 +512,8 @@ fn discover_with_contract(
                 }
                 if validate_peer(
                     source.ip(),
-                    interface,
-                    args.network.prefix_len,
+                    interface.address,
+                    interface.prefix_len,
                     args.network.allow_public,
                 )
                 .is_err()
@@ -491,6 +543,7 @@ fn discover_with_contract(
 
 fn negotiate(
     interface: Ipv4Addr,
+    prefix_len: u8,
     endpoint: SocketAddr,
     expected_session_id: Option<&str>,
     local: &Compatibility,
@@ -559,7 +612,7 @@ fn negotiate(
             validate_peer(
                 advertised.ip(),
                 interface,
-                args.discovery.network.prefix_len,
+                prefix_len,
                 args.discovery.network.allow_public,
             )?;
         }
@@ -582,6 +635,7 @@ fn receive_probe(
     socket: &UdpSocket,
     buffer: &mut [u8],
     interface: Ipv4Addr,
+    prefix_len: u8,
     args: &LanHostArgs,
     session: &SessionDescriptor,
 ) -> Result<()> {
@@ -604,7 +658,7 @@ fn receive_probe(
     if validate_peer(
         source.ip(),
         interface,
-        args.network.prefix_len,
+        prefix_len,
         args.network.allow_public,
     )
     .is_err()
@@ -625,6 +679,7 @@ fn receive_join(
     socket: &UdpSocket,
     buffer: &mut [u8],
     interface: Ipv4Addr,
+    prefix_len: u8,
     args: &LanHostArgs,
     session: &SessionDescriptor,
     replay_guard: &mut ReplayGuard,
@@ -653,7 +708,7 @@ fn receive_join(
     if validate_peer(
         source.ip(),
         interface,
-        args.network.prefix_len,
+        prefix_len,
         args.network.allow_public,
     )
     .is_err()
@@ -874,7 +929,7 @@ pub fn address_allowed(address: IpAddr) -> bool {
     }
 }
 
-fn checked_interface(network: &LanNetworkArgs) -> Result<Ipv4Addr> {
+fn checked_interface(network: &LanNetworkArgs) -> Result<ResolvedInterface> {
     ensure!(
         matches!(network.bind, IpAddr::V4(_)),
         "LAN bind address must be IPv4; use 0.0.0.0 or the selected IPv4 interface"
@@ -883,14 +938,13 @@ fn checked_interface(network: &LanNetworkArgs) -> Result<Ipv4Addr> {
         network.discovery_port != 0 && network.session_port != 0,
         "discovery and negotiation ports must be non-zero"
     );
-    let interface = resolve_interface(network.interface)?;
+    let interface = resolve_interface(network.interface, network.prefix_len)?;
     ensure!(
-        network.allow_public || address_allowed(interface),
-        "interface {interface} is not private, loopback, or link-local; pass --allow-public to override"
+        !interface.is_loopback,
+        "loopback interface {} is diagnostic-only; select a broadcast-capable LAN interface",
+        interface.address
     );
-    let IpAddr::V4(interface) = interface else {
-        bail!("LAN discovery currently requires an IPv4 interface")
-    };
+    validate_interface_policy(&interface, network.allow_public)?;
     if !network.bind.is_unspecified() {
         ensure!(
             network.allow_public || address_allowed(network.bind),
@@ -898,12 +952,23 @@ fn checked_interface(network: &LanNetworkArgs) -> Result<Ipv4Addr> {
             network.bind
         );
         ensure!(
-            network.bind == IpAddr::V4(interface),
-            "concrete bind address {} must match interface {interface}",
-            network.bind
+            network.bind == IpAddr::V4(interface.address),
+            "concrete bind address {} must match interface {}",
+            network.bind,
+            interface.address,
         );
     }
     Ok(interface)
+}
+
+fn validate_interface_policy(interface: &ResolvedInterface, allow_public: bool) -> Result<()> {
+    ensure!(
+        allow_public || address_allowed(interface.address.into()),
+        "interface {} is not private, loopback, or link-local; pass --interface {} --allow-public to opt in",
+        interface.address,
+        interface.address
+    );
+    Ok(())
 }
 
 fn client_bind_address(configured: IpAddr, interface: Ipv4Addr) -> Result<IpAddr> {
@@ -917,19 +982,138 @@ fn client_bind_address(configured: IpAddr, interface: Ipv4Addr) -> Result<IpAddr
     Ok(configured)
 }
 
-fn resolve_interface(configured: Option<IpAddr>) -> Result<IpAddr> {
-    if let Some(interface) = configured {
-        ensure!(
-            !interface.is_unspecified(),
-            "interface address cannot be unspecified"
-        );
-        return Ok(interface);
-    }
+fn resolve_interface(
+    configured: Option<IpAddr>,
+    prefix_override: Option<u8>,
+) -> Result<ResolvedInterface> {
+    let interfaces = if_addrs::get_if_addrs()
+        .context("cannot read local network interface metadata")?
+        .into_iter()
+        .filter_map(|interface| {
+            let is_oper_up = interface.is_oper_up();
+            let is_point_to_point = interface.is_p2p();
+            let IfAddr::V4(address) = interface.addr else {
+                return None;
+            };
+            Some(LocalIpv4Interface {
+                name: interface.name,
+                address: address.ip,
+                netmask: address.netmask,
+                prefix_len: address.prefixlen,
+                broadcast: address.broadcast,
+                is_loopback: address.ip.is_loopback(),
+                is_oper_up,
+                is_point_to_point,
+            })
+        })
+        .collect::<Vec<_>>();
+    let default_route = if configured.is_none() {
+        Some(default_route_interface()?)
+    } else {
+        None
+    };
+    select_interface(configured, prefix_override, default_route, &interfaces)
+}
+
+fn default_route_interface() -> Result<Ipv4Addr> {
     let socket = UdpSocket::bind("0.0.0.0:0").context("cannot open interface probe socket")?;
     socket
         .connect("192.0.2.1:9")
         .context("cannot resolve a default local interface; pass --interface")?;
-    Ok(socket.local_addr()?.ip())
+    let IpAddr::V4(address) = socket.local_addr()?.ip() else {
+        bail!("default-route probe returned IPv6; pass --interface with a local IPv4 address")
+    };
+    Ok(address)
+}
+
+fn select_interface(
+    configured: Option<IpAddr>,
+    prefix_override: Option<u8>,
+    default_route: Option<Ipv4Addr>,
+    interfaces: &[LocalIpv4Interface],
+) -> Result<ResolvedInterface> {
+    let (address, automatic) = match configured {
+        Some(IpAddr::V4(address)) => {
+            ensure!(
+                !address.is_unspecified(),
+                "interface address cannot be unspecified"
+            );
+            (address, false)
+        }
+        Some(IpAddr::V6(_)) => bail!("LAN discovery currently requires an IPv4 interface"),
+        None => (
+            default_route.context(
+                "cannot resolve the active default-route IPv4 interface; pass --interface",
+            )?,
+            true,
+        ),
+    };
+    let metadata = interfaces
+        .iter()
+        .find(|interface| interface.address == address)
+        .with_context(|| {
+            if automatic {
+                format!(
+                    "default-route address {address} does not map to a local IPv4 interface; pass --interface"
+                )
+            } else {
+                format!("interface address {address} is not assigned to this host")
+            }
+        })?;
+    ensure!(
+        metadata.is_oper_up,
+        "interface {} ({address}) is not operationally up",
+        metadata.name
+    );
+    if let Some(prefix) = prefix_override {
+        ensure!(
+            prefix == metadata.prefix_len,
+            "--prefix-len {prefix} does not match interface {} actual prefix /{}",
+            metadata.name,
+            metadata.prefix_len
+        );
+    }
+    let mask = subnet_mask(metadata.prefix_len)?;
+    ensure!(
+        metadata.netmask == Ipv4Addr::from(mask),
+        "interface {} reports inconsistent IPv4 netmask {} and prefix /{}",
+        metadata.name,
+        metadata.netmask,
+        metadata.prefix_len
+    );
+    if !metadata.is_loopback {
+        ensure!(
+            metadata.prefix_len < 32,
+            "interface {} ({address}/{}) is not broadcast-capable; select an active LAN interface",
+            metadata.name,
+            metadata.prefix_len
+        );
+        ensure!(
+            !metadata.is_point_to_point,
+            "interface {} ({address}) is point-to-point, not a broadcast LAN interface",
+            metadata.name
+        );
+        let broadcast = metadata.broadcast.with_context(|| {
+            format!(
+                "interface {} ({address}/{}) has no broadcast address; select an active LAN interface",
+                metadata.name, metadata.prefix_len
+            )
+        })?;
+        let expected = directed_broadcast(address, metadata.prefix_len)?;
+        ensure!(
+            broadcast == expected,
+            "interface {} reports broadcast {broadcast}, inconsistent with {address}/{} ({expected})",
+            metadata.name,
+            metadata.prefix_len
+        );
+    }
+    Ok(ResolvedInterface {
+        name: metadata.name.clone(),
+        address,
+        prefix_len: metadata.prefix_len,
+        broadcast: metadata.broadcast,
+        is_loopback: metadata.is_loopback,
+    })
 }
 
 fn validate_peer(
@@ -963,11 +1147,12 @@ fn directed_broadcast(interface: Ipv4Addr, prefix_len: u8) -> Result<Ipv4Addr> {
 }
 
 fn subnet_mask(prefix_len: u8) -> Result<u32> {
-    ensure!(
-        (1..=32).contains(&prefix_len),
-        "IPv4 prefix length must be 1-32"
-    );
-    Ok(u32::MAX << (32 - prefix_len))
+    ensure!(prefix_len <= 32, "IPv4 prefix length must be 0-32");
+    Ok(if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    })
 }
 
 fn bind_socket(bind: IpAddr, port: u16, label: &str) -> Result<UdpSocket> {
@@ -1050,7 +1235,7 @@ mod tests {
             network: LanNetworkArgs {
                 bind: "127.0.0.1".parse().unwrap(),
                 interface: Some("127.0.0.1".parse().unwrap()),
-                prefix_len: 8,
+                prefix_len: Some(8),
                 discovery_port: 27_880,
                 session_port: 27_881,
                 allow_public: false,
@@ -1065,6 +1250,124 @@ mod tests {
 
     fn fixture_nonce(character: char) -> String {
         std::iter::repeat_n(character, NONCE_LENGTH).collect()
+    }
+
+    fn interface_fixture(
+        name: &str,
+        address: &str,
+        prefix_len: u8,
+        broadcast: Option<&str>,
+    ) -> LocalIpv4Interface {
+        LocalIpv4Interface {
+            name: name.to_owned(),
+            address: address.parse().unwrap(),
+            netmask: Ipv4Addr::from(subnet_mask(prefix_len).unwrap()),
+            prefix_len,
+            broadcast: broadcast.map(|value| value.parse().unwrap()),
+            is_loopback: address.starts_with("127."),
+            is_oper_up: true,
+            is_point_to_point: false,
+        }
+    }
+
+    #[test]
+    fn interface_selection_uses_actual_prefix_and_rejects_override_mismatch() {
+        let interfaces = [interface_fixture(
+            "wlan0",
+            "10.42.5.7",
+            22,
+            Some("10.42.7.255"),
+        )];
+        let selected =
+            select_interface(Some("10.42.5.7".parse().unwrap()), None, None, &interfaces).unwrap();
+        assert_eq!(selected.prefix_len, 22);
+        assert_eq!(selected.broadcast, Some("10.42.7.255".parse().unwrap()));
+
+        let error = select_interface(
+            Some("10.42.5.7".parse().unwrap()),
+            Some(24),
+            None,
+            &interfaces,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("actual prefix /22"));
+    }
+
+    #[test]
+    fn automatic_selection_rejects_32_tunnel_without_bridge_fallback() {
+        let mut tunnel = interface_fixture("psiphon0", "172.31.255.1", 32, None);
+        tunnel.is_point_to_point = true;
+        let mut bridge = interface_fixture("virbr0", "192.168.122.1", 24, Some("192.168.122.255"));
+        bridge.is_oper_up = false;
+        let error = select_interface(
+            None,
+            None,
+            Some("172.31.255.1".parse().unwrap()),
+            &[tunnel, bridge],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("psiphon0"));
+        assert!(error.to_string().contains("not broadcast-capable"));
+    }
+
+    #[test]
+    fn automatic_selection_never_falls_back_to_inactive_private_bridge() {
+        let mut bridge = interface_fixture("docker0", "172.17.0.1", 16, Some("172.17.255.255"));
+        bridge.is_oper_up = false;
+        let error = select_interface(None, None, Some("203.0.113.9".parse().unwrap()), &[bridge])
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("default-route address 203.0.113.9")
+        );
+    }
+
+    #[test]
+    fn explicit_interface_must_be_a_local_address() {
+        let interfaces = [interface_fixture(
+            "wlan0",
+            "192.168.1.20",
+            24,
+            Some("192.168.1.255"),
+        )];
+        let error = select_interface(
+            Some("192.168.1.99".parse().unwrap()),
+            None,
+            None,
+            &interfaces,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("is not assigned to this host"));
+    }
+
+    #[test]
+    fn explicit_loopback_remains_available_for_diagnostics() {
+        let interfaces = [interface_fixture("lo", "127.0.0.1", 8, None)];
+        let selected =
+            select_interface(Some("127.0.0.1".parse().unwrap()), None, None, &interfaces).unwrap();
+        assert!(selected.is_loopback);
+        assert_eq!(selected.prefix_len, 8);
+        assert_eq!(selected.broadcast, None);
+    }
+
+    #[test]
+    fn public_broadcast_interface_requires_explicit_policy_opt_in() {
+        let interfaces = [interface_fixture(
+            "campus-wifi",
+            "203.0.113.20",
+            24,
+            Some("203.0.113.255"),
+        )];
+        let selected = select_interface(
+            Some("203.0.113.20".parse().unwrap()),
+            None,
+            None,
+            &interfaces,
+        )
+        .unwrap();
+        assert!(validate_interface_policy(&selected, false).is_err());
+        assert!(validate_interface_policy(&selected, true).is_ok());
     }
 
     #[test]
@@ -1186,6 +1489,7 @@ mod tests {
                 &host,
                 &mut buffer,
                 "127.0.0.1".parse().unwrap(),
+                8,
                 &args,
                 &descriptor,
                 &mut replay_guard,
@@ -1236,6 +1540,7 @@ mod tests {
             &host,
             &mut buffer,
             "127.0.0.1".parse().unwrap(),
+            8,
             &args,
             &descriptor,
         )
@@ -1261,6 +1566,7 @@ mod tests {
                 &host,
                 &mut buffer,
                 "127.0.0.1".parse().unwrap(),
+                8,
                 &args,
                 &descriptor,
                 &mut replay_guard,
@@ -1284,6 +1590,7 @@ mod tests {
                 &host,
                 &mut buffer,
                 "127.0.0.1".parse().unwrap(),
+                8,
                 &args,
                 &descriptor,
                 &mut replay_guard,
@@ -1316,6 +1623,7 @@ mod tests {
                 &host,
                 &mut buffer,
                 "127.0.0.1".parse().unwrap(),
+                8,
                 &args,
                 &descriptor,
                 &mut replay_guard,
@@ -1353,6 +1661,7 @@ mod tests {
                 &host,
                 &mut buffer,
                 "127.0.0.1".parse().unwrap(),
+                8,
                 &args,
                 &descriptor,
                 &mut replay_guard,
@@ -1375,6 +1684,7 @@ mod tests {
                 &host,
                 &mut buffer,
                 "192.168.1.10".parse().unwrap(),
+                8,
                 &args,
                 &descriptor,
                 &mut replay_guard,

@@ -38,3 +38,6 @@
 - Generate a KOF-only Sunshine app/config with no Desktop, UPnP, broad web UI,
   global config, or internet binding; isolate Moonlight state and preserve the
   physical two-PC gameplay gate.
+- Validate LAN IPv4 selection against `if-addrs` metadata, use the interface's
+  actual prefix and broadcast, reject topology override mismatches, and never
+  fall back from an unusable default-route tunnel to inactive private bridges.

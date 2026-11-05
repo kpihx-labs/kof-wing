@@ -125,9 +125,9 @@ pub struct LanNetworkArgs {
     #[arg(long)]
     pub interface: Option<IpAddr>,
 
-    /// IPv4 prefix for directed broadcast and peer validation (default: /24).
-    #[arg(long, default_value_t = 24, value_parser = clap::value_parser!(u8).range(1..=32))]
-    pub prefix_len: u8,
+    /// Assert the selected interface's IPv4 prefix (normally detected from the OS).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=32))]
+    pub prefix_len: Option<u8>,
 
     /// UDP port for same-subnet discovery probes and announcements.
     #[arg(long, default_value_t = 27_880)]

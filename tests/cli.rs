@@ -123,14 +123,14 @@ fn readme_keeps_pairing_hitl_and_physical_gate_truthful() {
 }
 
 #[test]
-fn lan_discovery_rejects_public_interface_by_default() {
+fn lan_discovery_rejects_explicit_nonexistent_interface() {
     let output = Command::new(env!("CARGO_BIN_EXE_kof-wing"))
         .args(["lan", "discover", "--interface", "8.8.8.8"])
         .output()
         .expect("run LAN discovery policy check");
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 error");
-    assert!(stderr.contains("not private, loopback, or link-local"));
+    assert!(stderr.contains("is not assigned to this host"));
 }
 
 #[test]
