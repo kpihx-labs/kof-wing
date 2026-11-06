@@ -2,6 +2,8 @@ use std::{net::IpAddr, net::SocketAddr, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::input::{DeviceKind, InputPreset, InputSource};
+
 #[derive(Debug, Parser)]
 #[command(version, about)]
 pub struct Cli {
@@ -27,6 +29,11 @@ pub enum Command {
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
+    },
+    /// Inspect and edit the versioned per-profile input schema.
+    Input {
+        #[command(subcommand)]
+        command: InputCommand,
     },
     /// Discover, negotiate, and opt into pinned same-subnet LAN transport.
     Lan {
@@ -79,6 +86,99 @@ pub enum ProfileCommand {
     List,
     /// Create a named profile with a documented default configuration.
     Create { name: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InputCommand {
+    /// Print the active input schema.
+    Show {
+        #[arg(long, value_enum, default_value_t = InputFormat::Toml)]
+        format: InputFormat,
+    },
+    /// Add or replace one binding, creating its player/device when needed.
+    Set(InputSetArgs),
+    /// Replace the schema with no mappings or an optional built-in preset.
+    Reset {
+        #[arg(long, value_enum)]
+        preset: Option<InputPresetArg>,
+    },
+    /// Validate and atomically install a TOML or JSON schema.
+    Import { path: PathBuf },
+    /// Atomically export to a new .toml or .json file.
+    Export { path: PathBuf },
+    /// Validate schema, conflicts, and report exact backend limits.
+    Validate,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum InputFormat {
+    #[default]
+    Toml,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum InputPresetArg {
+    Authentic,
+    Modern,
+}
+
+impl From<InputPresetArg> for InputPreset {
+    fn from(value: InputPresetArg) -> Self {
+        match value {
+            InputPresetArg::Authentic => Self::Authentic,
+            InputPresetArg::Modern => Self::Modern,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct InputSetArgs {
+    #[arg(long)]
+    pub player: String,
+    #[arg(long)]
+    pub device: String,
+    #[arg(long, value_enum)]
+    pub kind: DeviceKindArg,
+    /// key:<name>, button:<name>, or axis:<name>:<positive|negative>.
+    #[arg(long = "control")]
+    pub control: InputSource,
+    /// Flash key name delivered to the game.
+    #[arg(long)]
+    pub target: String,
+    /// Optional safe logical device selector (not enforceable by Ruffle 0.7.1).
+    #[arg(long, conflicts_with = "clear_selector")]
+    pub selector: Option<String>,
+    /// Remove the existing logical device selector.
+    #[arg(long, conflicts_with = "selector")]
+    pub clear_selector: bool,
+    /// Set the normalized gamepad deadzone.
+    #[arg(long, conflicts_with = "clear_deadzone")]
+    pub deadzone: Option<f32>,
+    /// Remove the existing gamepad deadzone.
+    #[arg(long, conflicts_with = "deadzone")]
+    pub clear_deadzone: bool,
+    /// Axis activation threshold; valid only with an axis source.
+    #[arg(long)]
+    pub threshold: Option<f32>,
+    /// Additional simultaneously-held keyboard key; repeat for a chord.
+    #[arg(long = "chord")]
+    pub chord: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum DeviceKindArg {
+    Keyboard,
+    Gamepad,
+}
+
+impl From<DeviceKindArg> for DeviceKind {
+    fn from(value: DeviceKindArg) -> Self {
+        match value {
+            DeviceKindArg::Keyboard => Self::Keyboard,
+            DeviceKindArg::Gamepad => Self::Gamepad,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]

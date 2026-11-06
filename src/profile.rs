@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 
-use crate::{APP_NAME, config::ProfileConfig};
+use crate::{APP_NAME, config::ProfileConfig, input::InputConfig};
 
 #[derive(Debug, Clone)]
 pub struct ProfilePaths {
@@ -12,6 +12,7 @@ pub struct ProfilePaths {
     pub data_home: PathBuf,
     pub cache_home: PathBuf,
     pub config: PathBuf,
+    pub input: PathBuf,
     pub ruffle_config: PathBuf,
     pub saves: PathBuf,
     pub cache: PathBuf,
@@ -50,6 +51,7 @@ impl ProfilePaths {
             data_home: data,
             cache_home: cache,
             config: config_root.join("config.toml"),
+            input: config_root.join("input.toml"),
             ruffle_config: config_root.join("ruffle"),
             saves: data_root.join("saves"),
             cache: cache_root.clone(),
@@ -65,14 +67,24 @@ impl ProfilePaths {
     }
 
     pub fn create(&self) -> Result<()> {
-        if self.config.exists() {
+        if self.config.exists() || self.input.exists() {
             bail!("profile '{}' already exists", self.name);
         }
         for directory in [&self.ruffle_config, &self.saves, &self.cache] {
             fs::create_dir_all(directory)
                 .with_context(|| format!("cannot create {}", directory.display()))?;
         }
-        ProfileConfig::default().write_new(&self.config)
+        InputConfig::default().write_new(&self.input)?;
+        if let Err(error) = ProfileConfig::default().write_new(&self.config) {
+            fs::remove_file(&self.input).with_context(|| {
+                format!(
+                    "cannot roll back {} after profile creation failed: {error:#}",
+                    self.input.display()
+                )
+            })?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn require_config(&self) -> Result<ProfileConfig> {
@@ -84,6 +96,17 @@ impl ProfilePaths {
             );
         }
         ProfileConfig::read(&self.config)
+    }
+
+    pub fn require_input(&self) -> Result<InputConfig> {
+        if !self.input.is_file() {
+            bail!(
+                "input config for profile '{}' does not exist; run `kof-wing --profile {} input reset`",
+                self.name,
+                self.name
+            );
+        }
+        InputConfig::read(&self.input)
     }
 }
 
@@ -125,7 +148,11 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_name;
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{ProfilePaths, validate_name};
 
     #[test]
     fn profile_names_are_safe_path_components() {
@@ -135,5 +162,22 @@ mod tests {
         for invalid in ["", "../escape", "two words", "é"] {
             assert!(validate_name(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn profile_creation_does_not_overwrite_or_expose_partial_input() {
+        let temp = tempdir().unwrap();
+        let profile = ProfilePaths::from_roots(
+            "arcade",
+            temp.path().join("config"),
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        );
+        fs::create_dir_all(profile.input.parent().unwrap()).unwrap();
+        fs::write(&profile.input, b"keep me").unwrap();
+
+        assert!(profile.create().is_err());
+        assert_eq!(fs::read(&profile.input).unwrap(), b"keep me");
+        assert!(!profile.config.exists());
     }
 }

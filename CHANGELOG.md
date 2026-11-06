@@ -10,7 +10,7 @@
   `profile`, `runtime`, and `lan`).
 - Add hash-gated, cached projector extraction and pinned Linux/Windows Ruffle
   runtime contracts.
-- Add platform-native isolated profiles, typed stage/music/control TOML, and
+- Add platform-native isolated profiles, typed stage/music configuration, and
   generated read-only source overlays.
 - Add `doctor`, `play`, `profile list`, `profile create`, and diagnostic-only
   `lan doctor` commands.
@@ -18,6 +18,9 @@
   formatting, lint, test, release, shell, and tool gates in `make check`.
 - Isolate the generated runtime tree with real file copies instead of writable
   links to original assets.
+- Anchor source-tree copying to retained directory handles and reject symlinks
+  and Windows reparse points on every child open, including concurrent path
+  replacement during traversal.
 - Pass a canonical percent-encoded cross-platform `file://` base URL to Ruffle
   and lock its exact argument contract with parser-to-command regression tests.
 - Validate Ruffle gamepad button and Flash key names before process launch.
@@ -41,3 +44,20 @@
 - Validate LAN IPv4 selection against `if-addrs` metadata, use the interface's
   actual prefix and broadcast, reject topology override mismatches, and never
   fall back from an unusable default-route tunnel to inactive private bridges.
+- Add a strict version-1 per-profile input schema for multiple players and
+  logical keyboard/gamepad devices, including buttons, keys, axes, deadzones,
+  thresholds, selectors, and chords with safe identifiers and explicit conflict
+  detection; an empty schema remains valid.
+- Add optional `authentic` and `modern` input presets plus `input show`, `set`,
+  `reset`, `import`, `export`, and `validate` commands with atomic TOML/JSON
+  writes, non-destructive export, and explicit selector/deadzone clearing.
+- Compile only exactly representable mappings to Ruffle 0.7.1
+  `--gamepad-button` arguments, reject unsupported active transformations at
+  play time, and report keyboard/device/axis/deadzone/chord limits explicitly.
+- Bind input configuration into LAN compatibility, derive Sunshine keyboard and
+  controller channels from enabled devices, and select Moonlight
+  `--multi-controller`/`--no-multi-controller` from the profile without claiming
+  backend capabilities those tools do not expose.
+- Canonicalize semantically equivalent input mappings for LAN hashes, reject
+  stale Sunshine channel policy, and reverify extracted Windows transport files
+  against their pinned archives before reuse.

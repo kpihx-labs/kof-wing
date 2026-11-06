@@ -8,7 +8,14 @@
   hardware-accelerated low-latency media, discovery, reconnect, and latency
   diagnostics.
 - [x] Add named profiles.
-- [ ] Add deterministic input replay, save snapshots, and authentic/free presets.
+- [ ] Add deterministic input replay and save snapshots.
+- [x] Add optional authentic and modern input presets.
+- [x] Deliver a fully editable keyboard/gamepad schema and CLI with per-player
+  and per-device profiles, modeled axes/deadzones/chords, conflict detection,
+  and portable import/export; defaults remain optional presets only.
+- [ ] Add a future input backend that can enforce physical-device selectors,
+  per-player routing, axes/deadzones, chords, and live remapping; pinned Ruffle
+  0.7.1 and Sunshine/Moonlight do not expose those controls.
 
 ## Completed for 0.1.0
 

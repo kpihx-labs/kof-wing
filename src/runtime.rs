@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use crate::{cli::PlayArgs, config::Controls, profile::ProfilePaths, source::verify_hash};
+use crate::{cli::PlayArgs, input::InputConfig, profile::ProfilePaths, source::verify_hash};
 
 pub const RUFFLE_VERSION: &str = "0.7.1";
 pub const LINUX_RUFFLE_ARCHIVE_SHA256: &str =
@@ -69,14 +69,14 @@ pub fn launch(
     swf: &Path,
     base: &Path,
     profile: &ProfilePaths,
-    controls: &Controls,
+    input: &InputConfig,
     options: &PlayArgs,
 ) -> Result<()> {
     for directory in [&profile.ruffle_config, &profile.saves, &profile.cache] {
         std::fs::create_dir_all(directory)
             .with_context(|| format!("cannot create runtime directory {}", directory.display()))?;
     }
-    let arguments = arguments(swf, base, profile, controls, options)?;
+    let arguments = arguments(swf, base, profile, input, options)?;
     let status = Command::new(executable)
         .args(arguments)
         .status()
@@ -91,10 +91,10 @@ pub fn arguments(
     swf: &Path,
     base: &Path,
     profile: &ProfilePaths,
-    controls: &Controls,
+    input: &InputConfig,
     options: &PlayArgs,
 ) -> Result<Vec<OsString>> {
-    controls.validate()?;
+    let mappings = input.ruffle_mappings()?;
     let dimension_scale = u32::from(options.scale);
     let mut arguments = vec![
         "--config".into(),
@@ -125,7 +125,7 @@ pub fn arguments(
     if options.fullscreen {
         arguments.push("--fullscreen".into());
     }
-    for (button, key) in &controls.gamepad {
+    for (button, key) in mappings {
         arguments.push("--gamepad-button".into());
         arguments.push(format!("{button}={key}").into());
     }
@@ -209,7 +209,7 @@ mod tests {
 
     use crate::{
         cli::{Cli, Command, Graphics},
-        config::Controls,
+        input::{Binding, DeviceKind, InputConfig, InputSource},
         profile::ProfilePaths,
     };
 
@@ -258,9 +258,24 @@ mod tests {
         assert_eq!(options.scale, 3);
         assert!(matches!(options.graphics, Graphics::Gl));
 
-        let mut controls = Controls::default();
-        controls.gamepad.insert("south".into(), "j".into());
-        let actual = arguments(&swf, &overlay, &profile, &controls, &options)
+        let mut input = InputConfig::default();
+        input
+            .set_binding(
+                "p1",
+                "pad",
+                DeviceKind::Gamepad,
+                crate::input::FieldUpdate::Keep,
+                crate::input::FieldUpdate::Keep,
+                Binding {
+                    source: InputSource::Button {
+                        button: "south".into(),
+                    },
+                    target: "j".into(),
+                    chord: Vec::new(),
+                },
+            )
+            .expect("valid mapping");
+        let actual = arguments(&swf, &overlay, &profile, &input, &options)
             .expect("assemble Ruffle arguments");
         #[cfg(unix)]
         let base_url = format!(
@@ -322,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_controls_during_argument_assembly() {
+    fn rejects_input_features_that_ruffle_cannot_apply_exactly() {
         let temp = tempdir().expect("temp dir");
         let overlay = temp.path().join("overlay");
         fs::create_dir(&overlay).expect("overlay directory");
@@ -332,8 +347,21 @@ mod tests {
             temp.path().join("data"),
             temp.path().join("cache"),
         );
-        let mut controls = Controls::default();
-        controls.gamepad.insert("south".into(), "j=bad".into());
+        let mut input = InputConfig::default();
+        input
+            .set_binding(
+                "p1",
+                "keyboard",
+                DeviceKind::Keyboard,
+                crate::input::FieldUpdate::Keep,
+                crate::input::FieldUpdate::Keep,
+                Binding {
+                    source: InputSource::Key { key: "w".into() },
+                    target: "up".into(),
+                    chord: Vec::new(),
+                },
+            )
+            .unwrap();
         let options = crate::cli::PlayArgs {
             fullscreen: false,
             window: true,
@@ -345,7 +373,7 @@ mod tests {
                 &temp.path().join("game.swf"),
                 &overlay,
                 &profile,
-                &controls,
+                &input,
                 &options
             )
             .is_err()

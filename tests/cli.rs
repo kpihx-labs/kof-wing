@@ -10,7 +10,7 @@ fn help_exposes_preservation_commands() {
         .expect("run launcher help");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
-    for command in ["doctor", "play", "profile", "lan"] {
+    for command in ["doctor", "play", "profile", "input", "lan"] {
         assert!(stdout.contains(command), "help omitted {command}");
     }
 }
@@ -171,4 +171,245 @@ fn profile_create_and_list_use_platform_directories() {
     );
     assert!(data_home.join("kof-wing/profiles/arcade/saves").is_dir());
     assert!(cache_home.join("kof-wing/profiles/arcade").is_dir());
+    assert!(
+        config_home
+            .join("kof-wing/profiles/arcade/input.toml")
+            .is_file()
+    );
+}
+
+#[test]
+fn input_cli_covers_empty_presets_set_conflicts_and_backend_limits() {
+    let temp = tempdir().expect("temp dir");
+    let binary = env!("CARGO_BIN_EXE_kof-wing");
+    let environment = [
+        ("XDG_CONFIG_HOME", temp.path().join("config")),
+        ("XDG_DATA_HOME", temp.path().join("data")),
+        ("XDG_CACHE_HOME", temp.path().join("cache")),
+        ("KOF_WING_WORK", temp.path().join("work")),
+    ];
+    let run = |arguments: &[&str]| {
+        let mut command = Command::new(binary);
+        command.args(arguments);
+        for (name, value) in &environment {
+            command.env(name, value);
+        }
+        command.output().expect("run input command")
+    };
+
+    let help = run(&["input", "--help"]);
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).expect("UTF-8 input help");
+    for command in ["show", "set", "reset", "import", "export", "validate"] {
+        assert!(help.contains(command), "input help omitted {command}");
+    }
+    let set_help = run(&["input", "set", "--help"]);
+    let set_help = String::from_utf8(set_help.stdout).expect("UTF-8 input set help");
+    for option in ["--clear-selector", "--clear-deadzone"] {
+        assert!(set_help.contains(option), "input set help omitted {option}");
+    }
+
+    assert!(run(&["profile", "create", "inputs"]).status.success());
+    let empty = run(&["--profile", "inputs", "input", "validate"]);
+    assert!(empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stdout).contains("mappings: 0"));
+
+    assert!(
+        run(&[
+            "--profile",
+            "inputs",
+            "input",
+            "reset",
+            "--preset",
+            "modern",
+        ])
+        .status
+        .success()
+    );
+    let show = run(&["--profile", "inputs", "input", "show", "--format", "json"]);
+    let json = String::from_utf8(show.stdout).expect("UTF-8 input JSON");
+    assert!(json.contains("\"version\": 1"));
+    assert!(json.contains("\"preset\": \"modern\""));
+
+    let conflict = run(&[
+        "--profile",
+        "inputs",
+        "input",
+        "set",
+        "--player",
+        "p2",
+        "--device",
+        "pad2",
+        "--kind",
+        "gamepad",
+        "--control",
+        "button:south",
+        "--target",
+        "j",
+    ]);
+    assert!(!conflict.status.success());
+    assert!(
+        String::from_utf8_lossy(&conflict.stderr).contains("Ruffle conflict"),
+        "{}",
+        String::from_utf8_lossy(&conflict.stderr)
+    );
+
+    assert!(
+        run(&["--profile", "inputs", "input", "reset"])
+            .status
+            .success()
+    );
+    let axis = run(&[
+        "--profile",
+        "inputs",
+        "input",
+        "set",
+        "--player",
+        "p1",
+        "--device",
+        "pad",
+        "--kind",
+        "gamepad",
+        "--control",
+        "axis:left-x:positive",
+        "--target",
+        "right",
+        "--selector",
+        "primary",
+        "--deadzone",
+        "0.15",
+        "--threshold",
+        "0.6",
+    ]);
+    assert!(axis.status.success());
+    let validation = run(&["--profile", "inputs", "input", "validate"]);
+    assert!(validation.status.success());
+    let report = String::from_utf8(validation.stdout).expect("UTF-8 validation");
+    assert!(report.contains("no axis mapping argument"));
+    assert!(report.contains("no deadzone argument"));
+
+    let clear = run(&[
+        "--profile",
+        "inputs",
+        "input",
+        "set",
+        "--player",
+        "p1",
+        "--device",
+        "pad",
+        "--kind",
+        "gamepad",
+        "--control",
+        "axis:left-x:positive",
+        "--target",
+        "right",
+        "--threshold",
+        "0.6",
+        "--clear-selector",
+        "--clear-deadzone",
+    ]);
+    assert!(clear.status.success());
+    let show = run(&["--profile", "inputs", "input", "show", "--format", "json"]);
+    let json = String::from_utf8(show.stdout).expect("UTF-8 cleared input JSON");
+    assert!(!json.contains("\"selector\""));
+    assert!(!json.contains("\"deadzone\""));
+
+    for conflicting in [
+        ["--selector", "primary", "--clear-selector"],
+        ["--deadzone", "0.1", "--clear-deadzone"],
+    ] {
+        let mut arguments = vec![
+            "--profile",
+            "inputs",
+            "input",
+            "set",
+            "--player",
+            "p1",
+            "--device",
+            "pad",
+            "--kind",
+            "gamepad",
+            "--control",
+            "button:south",
+            "--target",
+            "k",
+        ];
+        arguments.extend(conflicting);
+        let conflict = run(&arguments);
+        assert!(!conflict.status.success());
+        assert!(String::from_utf8_lossy(&conflict.stderr).contains("cannot be used with"));
+    }
+}
+
+#[test]
+fn input_import_export_is_typed_atomic_and_non_destructive() {
+    let temp = tempdir().expect("temp dir");
+    let config_home = temp.path().join("config");
+    let data_home = temp.path().join("data");
+    let cache_home = temp.path().join("cache");
+    let export = temp.path().join("portable/input.JSON");
+    let binary = env!("CARGO_BIN_EXE_kof-wing");
+    let run = |arguments: &[&str]| {
+        Command::new(binary)
+            .args(arguments)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_DATA_HOME", &data_home)
+            .env("XDG_CACHE_HOME", &cache_home)
+            .output()
+            .expect("run input command")
+    };
+
+    assert!(run(&["profile", "create", "portable"]).status.success());
+    assert!(
+        run(&[
+            "--profile",
+            "portable",
+            "input",
+            "reset",
+            "--preset",
+            "modern",
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        run(&[
+            "--profile",
+            "portable",
+            "input",
+            "export",
+            export.to_str().expect("Unicode path"),
+        ])
+        .status
+        .success()
+    );
+    assert!(export.is_file());
+    let overwrite = run(&[
+        "--profile",
+        "portable",
+        "input",
+        "export",
+        export.to_str().expect("Unicode path"),
+    ]);
+    assert!(!overwrite.status.success());
+    assert!(String::from_utf8_lossy(&overwrite.stderr).contains("refusing to overwrite"));
+
+    assert!(
+        run(&["--profile", "portable", "input", "reset"])
+            .status
+            .success()
+    );
+    assert!(
+        run(&[
+            "--profile",
+            "portable",
+            "input",
+            "import",
+            export.to_str().expect("Unicode path"),
+        ])
+        .status
+        .success()
+    );
+    let show = run(&["--profile", "portable", "input", "show", "--format", "json"]);
+    assert!(String::from_utf8_lossy(&show.stdout).contains("\"preset\": \"modern\""));
 }

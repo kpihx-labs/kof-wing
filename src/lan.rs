@@ -378,9 +378,25 @@ pub fn join(profile_name: &str, args: &LanJoinArgs) -> Result<SessionDescriptor>
 pub fn local_compatibility(profile_name: &str) -> Result<Compatibility> {
     let profile = ProfilePaths::discover(profile_name)?;
     let config = profile.require_config()?;
-    let canonical_profile =
-        toml::to_string(&config).context("cannot canonicalize profile config")?;
-    Ok(compatibility_from_profile(canonical_profile.as_bytes()))
+    let input = profile.require_input()?;
+    Ok(compatibility_from_profile(
+        canonical_profile(&config, &input)?.as_bytes(),
+    ))
+}
+
+fn canonical_profile(
+    config: &crate::config::ProfileConfig,
+    input: &crate::input::InputConfig,
+) -> Result<String> {
+    let canonical_profile = format!(
+        "{}\n--- input-v{} ---\n{}",
+        toml::to_string(&config).context("cannot canonicalize profile config")?,
+        input.version,
+        input
+            .canonical_toml()
+            .context("cannot canonicalize input config")?
+    );
+    Ok(canonical_profile)
 }
 
 fn compatibility_from_profile(profile: &[u8]) -> Compatibility {
@@ -727,9 +743,8 @@ fn receive_join(
         .map(|expected| format!("requested session {expected} is no longer active"));
     let rejection = contract_error.or(session_error).or(difference);
     let accepted = rejection.is_none();
-    let reason = rejection.unwrap_or_else(|| {
-        "compatibility hashes match; transport capabilities remain unavailable".to_owned()
-    });
+    let reason = rejection
+        .unwrap_or_else(|| "compatibility hashes and capability contract match".to_owned());
     send_packet(
         socket,
         source,
@@ -1808,15 +1823,41 @@ mod tests {
 
     #[test]
     fn profile_hash_is_canonical_and_changes_session_hash() {
-        let first_config: crate::config::ProfileConfig =
-            toml::from_str("[controls.gamepad]\nsouth='j'\n").unwrap();
-        let same_config: crate::config::ProfileConfig =
-            toml::from_str("\n[controls.gamepad]\nsouth = \"j\"\n").unwrap();
-        let changed_config: crate::config::ProfileConfig =
-            toml::from_str("[controls.gamepad]\nsouth='k'\n").unwrap();
-        let first = compatibility(toml::to_string(&first_config).unwrap().as_bytes());
-        let same = compatibility(toml::to_string(&same_config).unwrap().as_bytes());
-        let changed = compatibility(toml::to_string(&changed_config).unwrap().as_bytes());
+        let make_input = |bindings: &[(&str, &str)]| {
+            let mut input = crate::input::InputConfig::default();
+            for (button, target) in bindings {
+                input
+                    .set_binding(
+                        "p1",
+                        "pad",
+                        crate::input::DeviceKind::Gamepad,
+                        crate::input::FieldUpdate::Keep,
+                        crate::input::FieldUpdate::Keep,
+                        crate::input::Binding {
+                            source: format!("button:{button}").parse().unwrap(),
+                            target: (*target).to_owned(),
+                            chord: vec![],
+                        },
+                    )
+                    .unwrap();
+            }
+            input
+        };
+        let profile = crate::config::ProfileConfig::default();
+        let first_input = make_input(&[("south", "j"), ("east", "k")]);
+        let same_input = make_input(&[("EAST", "K"), ("SOUTH", "J")]);
+        let changed_input = make_input(&[("south", "j"), ("east", "l")]);
+        let first = compatibility(
+            canonical_profile(&profile, &first_input)
+                .unwrap()
+                .as_bytes(),
+        );
+        let same = compatibility(canonical_profile(&profile, &same_input).unwrap().as_bytes());
+        let changed = compatibility(
+            canonical_profile(&profile, &changed_input)
+                .unwrap()
+                .as_bytes(),
+        );
         assert_eq!(first, same);
         assert_ne!(first.profile_sha256, changed.profile_sha256);
         assert_ne!(first.session_sha256, changed.session_sha256);
