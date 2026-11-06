@@ -246,6 +246,40 @@ font, layout, and gameplay prerequisites and its hash matches. An activated
 patch hash also replaces the base SWF hash in the canonical LAN/session
 contract. See `research/i18n-pipeline-audit.md` for exact hashes and evidence.
 
+Technical blocker resolution (2026-11-06): a subsequent local-only pass
+supersedes the measured 1/241 mechanism result above. The parser now recognizes
+all observed FFDec directives (including `spacing`, `spacingpair`,
+`resetspacing`, `letterspacing`, and `variablename`), preserves every formatted
+metadata block byte-for-byte in the import recipe, and distributes long static
+text over existing SWF UI8-sized text records. A small Java helper uses FFDec's
+local library API to add required outlines from locally installed libre Noto
+Sans, Symbols, and CJK faces to each referenced embedded font; no font or game
+asset is uploaded or committed. The helper rejects Fontconfig substitutions and
+uses only exact Noto families. The locally installed Debian packages declare
+SIL Open Font License 1.1; this repository redistributes no font file. Fresh
+formatted re-export now yields exact semantic text for **241/241 EN and 241/241
+FR IDs**, with zero residual Han and complete requested glyph coverage. FFDec
+legitimately recalculates spacing
+metadata for 55 EN and 51 FR IDs after glyph substitution; these normalized IDs
+are recorded separately and are not confused with semantic mismatches.
+
+This does **not** activate either patch. Candidate screenshots visibly confirm
+that Latin/French glyphs render, but also expose severe clipping/overflow in the
+existing Chinese-sized layout. Human review is still 0/241 and layout/gameplay
+approval is absent, so activation manifests remain ineligible and `patched/`
+remains unpublished. Candidate captures are clearly separated under
+`work/i18n/captures/{en,fr}-candidate-roundtrip-241/`.
+
+Latest deterministic rerun note: enabling the tokenizer's documented regex fix
+and bounded no-repeat decoding changed the generated candidate hashes to
+`46bd21d67fd8694e8db9bc1a9b4ec9d7d5fa3a359c3385af9cc417b508647fe1`
+(EN) and `4d97dd64fe8de1c0764b501aaf0df5d0a7cbcca7356e0890cabc82a6f7119683`
+(FR). Exact round trip remains 241/241 in both languages; FFDec normalized
+formatted metadata for 52 EN and 51 FR IDs. Current QA flags 207 EN and 223 FR
+layout-risk IDs. The exact activation blockers for both languages are
+`qa_valid`, `font_valid`, `layout_valid`, `gameplay_valid`, and
+`missing_or_stale_local_visual_approval`.
+
 ## Historical 0.1.0 LAN boundary
 
 The first 0.1.0 launcher slice implemented only `lan doctor`: it reported UDP

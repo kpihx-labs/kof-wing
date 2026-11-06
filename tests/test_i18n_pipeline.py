@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/i18n-pipeline.py"
@@ -91,11 +92,136 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(header, "[\nfont 42\nheight 200\n]")
         self.assertEqual(body, "示例")
 
-    def test_formatted_parser_collapses_styled_define_text(self) -> None:
-        value = "[\nxmin 1\nymin 2\n][\nfont 42\nheight 200\n]前[\nfont 43\n]后"
-        header, body = PIPELINE.formatted_parts(value)
-        self.assertEqual(header, "[\nxmin 1\nymin 2\n][\nfont 42\nheight 200\n]")
-        self.assertEqual(body, "前后")
+    def test_formatted_parser_preserves_all_styled_metadata(self) -> None:
+        value = (
+            "[\nxmin 1\nymin 2\n][\nfont 42\nheight 200\n]前"
+            "[\nresetspacing\nspacingpair \"方\" \"向\" 81\n]方向"
+            "[space -1][\nfont 43\n]后"
+        )
+        metadata, body = PIPELINE.formatted_parts(value)
+        self.assertEqual(
+            metadata,
+            "[\nxmin 1\nymin 2\n][\nfont 42\nheight 200\n]"
+            "[\nresetspacing\nspacingpair \"方\" \"向\" 81\n]"
+            "[space -1][\nfont 43\n]",
+        )
+        self.assertEqual(body, "前方向后")
+
+    def test_formatted_replacement_keeps_every_metadata_block_exact(self) -> None:
+        value = (
+            "[\nxmin 1\nymin 2\n][\nfont 42\nheight 200\n]A     "
+            "[\nresetspacing\nspacingpair \"方\" \"向\" 81\n]方向键"
+            "[\nfont 43\n]←"
+        )
+        replacement = PIPELINE.formatted_replacement(value, "Direction key ←")
+        original_metadata, _ = PIPELINE.formatted_parts(value)
+        replaced_metadata, replaced_text = PIPELINE.formatted_parts(replacement)
+        self.assertEqual(replaced_metadata, original_metadata)
+        self.assertEqual(replaced_text, "Direction key ←")
+        self.assertNotIn("方向键", replacement)
+
+    def test_formatted_replacement_distributes_static_text_with_ui8_capacity(self) -> None:
+        value = (
+            "[\nxmin 1\nymin 2\n][\nfont 42\n]甲"
+            "[\nx 100\n]乙[\nfont 43\n]丙"
+        )
+        target = "A" * 405
+        replacement = PIPELINE.formatted_replacement(value, target)
+        visible_runs = [
+            segment
+            for metadata, segment in PIPELINE.formatted_segments(replacement)
+            if not metadata and segment
+        ]
+        self.assertEqual("".join(visible_runs), target)
+        self.assertTrue(all(len(run) <= 255 for run in visible_runs))
+
+    def test_formatted_replacement_allows_long_define_edit_text(self) -> None:
+        value = "[\nfont 42\n]甲"
+        replacement = PIPELINE.formatted_replacement(value, "A" * 256)
+        self.assertEqual(PIPELINE.formatted_parts(replacement)[1], "A" * 256)
+
+    def test_formatted_replacement_rejects_static_textrecord_overflow(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "TEXTRECORD capacity"):
+            PIPELINE.formatted_replacement(
+                "[\nfont 42\n]甲[\nx 100\n]乙", "A" * 511
+            )
+
+    def test_noto_family_identity_accepts_exact_and_rejects_fallback(self) -> None:
+        self.assertTrue(
+            PIPELINE.noto_family_identity_matches(
+                "Noto Sans Symbols 2:style=Regular", "Noto Sans Symbols2"
+            )
+        )
+        self.assertTrue(
+            PIPELINE.noto_family_identity_matches("Noto Sans:style=Regular", "Noto Sans")
+        )
+        self.assertFalse(
+            PIPELINE.noto_family_identity_matches(
+                "Noto Sans:style=Regular", "DejaVu Sans"
+            )
+        )
+        self.assertFalse(
+            PIPELINE.noto_family_identity_matches(
+                "Noto Sans Symbols 2:style=Regular", "Noto Sans"
+            )
+        )
+
+    def test_stage_local_noto_font_rejects_fontconfig_family_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = PIPELINE.Paths(Path(temporary))
+            with (
+                mock.patch.object(PIPELINE.shutil, "which", return_value="/usr/bin/fc-match"),
+                mock.patch.object(PIPELINE.subprocess, "run") as run,
+            ):
+                run.return_value.stdout = "DejaVu Sans\n/usr/share/fonts/dejavu.ttf\n"
+                with self.assertRaisesRegex(RuntimeError, "unexpected family"):
+                    PIPELINE.stage_local_noto_font(
+                        paths,
+                        "Noto Sans:style=Regular",
+                        paths.work / "NotoSans-Regular.ttf",
+                    )
+
+    def test_require_bmp_codepoints_rejects_supplementary_planes(self) -> None:
+        self.assertEqual(PIPELINE.require_bmp_codepoints("Aé中←"), "Aé中←")
+        with self.assertRaisesRegex(RuntimeError, r"U\+1F600"):
+            PIPELINE.require_bmp_codepoints("ok 😀")
+
+    def test_qa_rejects_duplicate_ids_and_forged_text_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = PIPELINE.Paths(Path(temporary))
+            source = "测试"
+            source_hash = PIPELINE.text_hash(source)
+            inventory_entry = {
+                "id": 42,
+                "source": source,
+                "source_sha256": source_hash,
+                "formatted_sha256": "synthetic",
+                "font_ids": [1],
+                "line_count": 1,
+                "characters": len(source),
+            }
+            PIPELINE.write_json(
+                paths,
+                paths.inventory,
+                {"entries": [inventory_entry], "base_sha256": PIPELINE.BASE_SHA256},
+            )
+            target_entry = {
+                "id": 42,
+                "source_sha256": source_hash,
+                "text": "Test",
+                "text_sha256": "forged",
+                "human_reviewed": True,
+                "ambiguities": [],
+            }
+            PIPELINE.write_json(
+                paths,
+                paths.translation("en"),
+                {"entries": [target_entry, dict(target_entry)]},
+            )
+            report = PIPELINE.qa_report(paths, "en")
+            self.assertFalse(report["structural_pass"])
+            self.assertIn("duplicate_translation_id", report["issue_counts"])
+            self.assertIn("target_text_hash_mismatch", report["issue_counts"])
 
     def test_path_helpers_reject_escape_and_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -195,7 +321,9 @@ class PipelineTests(unittest.TestCase):
                     "gameplay_valid": True,
                 },
             )
-            status = PIPELINE.activation_status(paths, "fr", "abc", report, True, [])
+            status = PIPELINE.activation_status(
+                paths, "fr", "abc", report, True, [], font_coverage=True
+            )
             self.assertTrue(status["eligible"])
             self.assertTrue(status["artifact"]["activation_path_published"])
             self.assertTrue(
@@ -203,6 +331,11 @@ class PipelineTests(unittest.TestCase):
                     {"reviewed_ids": list(reversed(expected))}, frozenset(expected)
                 )
             )
+
+            # Negative: font coverage is fail-closed unless the helper completed.
+            status = PIPELINE.activation_status(paths, "fr", "abc", report, True, [])
+            self.assertFalse(status["eligible"])
+            self.assertIn("font_coverage", status["blockers"])
 
             # Negative: any other 241 ints (range) must not pass.
             PIPELINE.write_json(

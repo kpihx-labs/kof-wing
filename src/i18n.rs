@@ -172,9 +172,27 @@ pub struct EmbeddedPrerequisites {
     pub coverage_100: bool,
     pub qa_valid: bool,
     pub roundtrip_exact: bool,
+    pub font_coverage: bool,
     pub font_valid: bool,
     pub layout_valid: bool,
     pub gameplay_valid: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedRoundtrip {
+    pub exact_ids: usize,
+    pub total_ids: usize,
+    pub mismatch_ids: Vec<u32>,
+    pub formatted_metadata_normalized_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedArtifact {
+    pub candidate: String,
+    pub patched: String,
+    pub activation_path_published: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -189,6 +207,8 @@ pub struct EmbeddedActivation {
     pub prerequisites: EmbeddedPrerequisites,
     pub eligible: bool,
     pub blockers: Vec<String>,
+    pub roundtrip: EmbeddedRoundtrip,
+    pub artifact: EmbeddedArtifact,
 }
 
 #[derive(Debug, Clone)]
@@ -268,17 +288,28 @@ pub fn select_embedded_swf(work: &Path, language: &str, base: &Path) -> Result<E
     let all_prerequisites = prerequisites.coverage_100
         && prerequisites.qa_valid
         && prerequisites.roundtrip_exact
+        && prerequisites.font_coverage
         && prerequisites.font_valid
         && prerequisites.layout_valid
         && prerequisites.gameplay_valid;
     let counts_complete = status.coverage_total == EMBEDDED_HAN_SYMBOLS
         && status.coverage_translated == EMBEDDED_HAN_SYMBOLS;
-    if !status.eligible || !all_prerequisites || !counts_complete || !status.blockers.is_empty() {
+    let roundtrip_complete = status.roundtrip.exact_ids == EMBEDDED_HAN_SYMBOLS
+        && status.roundtrip.total_ids == EMBEDDED_HAN_SYMBOLS
+        && status.roundtrip.mismatch_ids.is_empty();
+    if !status.eligible
+        || !all_prerequisites
+        || !counts_complete
+        || !roundtrip_complete
+        || !status.artifact.activation_path_published
+        || !status.blockers.is_empty()
+    {
         let mut blockers = status.blockers.clone();
         for (name, valid) in [
             ("coverage_100", prerequisites.coverage_100),
             ("qa_valid", prerequisites.qa_valid),
             ("roundtrip_exact", prerequisites.roundtrip_exact),
+            ("font_coverage", prerequisites.font_coverage),
             ("font_valid", prerequisites.font_valid),
             ("layout_valid", prerequisites.layout_valid),
             ("gameplay_valid", prerequisites.gameplay_valid),
@@ -292,6 +323,12 @@ pub fn select_embedded_swf(work: &Path, language: &str, base: &Path) -> Result<E
                 "coverage counts incomplete: {}/{} translated of required {}",
                 status.coverage_translated, status.coverage_total, EMBEDDED_HAN_SYMBOLS
             ));
+        }
+        if !roundtrip_complete {
+            blockers.push("roundtrip details are incomplete or inconsistent".to_owned());
+        }
+        if !status.artifact.activation_path_published {
+            blockers.push("activation path is not published".to_owned());
         }
         if status.eligible {
             blockers.push("activation manifest claims eligibility inconsistently".to_owned());
@@ -810,9 +847,10 @@ mod tests {
     #[cfg(unix)]
     use super::export;
     use super::{
-        Catalog, EmbeddedActivation, EmbeddedPrerequisites, LanguageConfig, MAX_CATALOG_BYTES,
-        canonical_language_id, compatibility_contract, install, list, report_embedded_selection,
-        resolve, resolve_selected, select_embedded_swf, write_wrapper,
+        Catalog, EmbeddedActivation, EmbeddedArtifact, EmbeddedPrerequisites, EmbeddedRoundtrip,
+        LanguageConfig, MAX_CATALOG_BYTES, canonical_language_id, compatibility_contract, install,
+        list, report_embedded_selection, resolve, resolve_selected, select_embedded_swf,
+        write_wrapper,
     };
 
     #[test]
@@ -1155,12 +1193,24 @@ mod tests {
                 coverage_100: true,
                 qa_valid: true,
                 roundtrip_exact: true,
+                font_coverage: true,
                 font_valid: true,
                 layout_valid: true,
                 gameplay_valid: true,
             },
             eligible: false,
             blockers: vec!["synthetic review blocker".to_owned()],
+            roundtrip: EmbeddedRoundtrip {
+                exact_ids: super::EMBEDDED_HAN_SYMBOLS,
+                total_ids: super::EMBEDDED_HAN_SYMBOLS,
+                mismatch_ids: Vec::new(),
+                formatted_metadata_normalized_ids: Vec::new(),
+            },
+            artifact: EmbeddedArtifact {
+                candidate: "work/i18n/candidates/kof-wing-ex-v1.0.en.swf".to_owned(),
+                patched: "work/i18n/patched/kof-wing-ex-v1.0.en.swf".to_owned(),
+                activation_path_published: false,
+            },
         };
         fs::write(
             activation_dir.join("en.json"),
@@ -1175,6 +1225,23 @@ mod tests {
 
         status.eligible = true;
         status.blockers.clear();
+        status.artifact.activation_path_published = true;
+        status.prerequisites.font_coverage = false;
+        fs::write(
+            activation_dir.join("en.json"),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+        let missing_font_coverage = select_embedded_swf(temp.path(), "en", &base).unwrap();
+        assert!(!missing_font_coverage.active);
+        assert!(
+            missing_font_coverage
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "font_coverage")
+        );
+
+        status.prerequisites.font_coverage = true;
         fs::write(
             activation_dir.join("en.json"),
             serde_json::to_vec(&status).unwrap(),
@@ -1216,6 +1283,7 @@ mod tests {
                 coverage_100: false,
                 qa_valid: false,
                 roundtrip_exact: false,
+                font_coverage: false,
                 font_valid: false,
                 layout_valid: false,
                 gameplay_valid: false,
@@ -1226,6 +1294,17 @@ mod tests {
                 "font_valid".to_owned(),
                 "roundtrip_mismatch_ids:1".to_owned(),
             ],
+            roundtrip: EmbeddedRoundtrip {
+                exact_ids: 1,
+                total_ids: super::EMBEDDED_HAN_SYMBOLS,
+                mismatch_ids: vec![1],
+                formatted_metadata_normalized_ids: Vec::new(),
+            },
+            artifact: EmbeddedArtifact {
+                candidate: "work/i18n/candidates/kof-wing-ex-v1.0.fr.swf".to_owned(),
+                patched: "work/i18n/patched/kof-wing-ex-v1.0.fr.swf".to_owned(),
+                activation_path_published: false,
+            },
         };
         fs::write(
             activation_dir.join("fr.json"),

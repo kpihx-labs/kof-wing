@@ -71,3 +71,13 @@
 - [ ] Authenticate the launcher negotiation channel before use on untrusted LANs.
 - [ ] Pass the two-physical-PC Ubuntu/Windows release gate before describing LAN
   gameplay as available.
+
+## Embedded localization blocker update (2026-11-06)
+
+- [x] Resolve FFDec formatted parsing, ID `25878` spacing import, embedded-font
+  Latin/French glyph coverage, static `TEXTRECORD` UI8 capacity, and exact fresh
+  re-export: EN 241/241 and FR 241/241, with zero residual Han in inventoried IDs.
+- [ ] Human-review all 241 EN and 241 FR candidates, shorten/reflow the measured
+  clipping risks, validate all reachable screens and external/script text, then
+  approve font/layout/gameplay before the fail-closed launcher may publish either
+  generated candidate to `work/i18n/patched/`.

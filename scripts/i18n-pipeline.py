@@ -32,6 +32,7 @@ EXPECTED_HAN = 241
 LANGUAGES = {"en": "eng_Latn", "fr": "fra_Latn"}
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_TEXT_BYTES = 2 * 1024 * 1024
+MAX_FONT_BYTES = 64 * 1024 * 1024
 SUBPROCESS_TIMEOUT_SECONDS = 1800
 HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 NUMBER = re.compile(r"(?<![\w])[-+]?\d+(?:[.,:/-]\d+)*(?![\w])")
@@ -40,6 +41,44 @@ PLACEHOLDER = re.compile(
     r"%[#0+\- .\d]*[a-zA-Z]|<[^<>\r\n]+>|[A-Za-z][A-Za-z0-9_.+/@:'\-]*(?:\s+[A-Za-z0-9_.+/@:'\-]+)*)"
 )
 LINE_ENDING = re.compile(r"\r\n|\r|\n")
+FORMATTED_DIRECTIVES = frozenset(
+    {
+        "align",
+        "border",
+        "color",
+        "devicefont",
+        "font",
+        "height",
+        "html",
+        "indent",
+        "leading",
+        "leftmargin",
+        "letterspacing",
+        "maxlength",
+        "multiline",
+        "noselect",
+        "password",
+        "readonly",
+        "resetspacing",
+        "rightmargin",
+        "space",
+        "spacing",
+        "spacingpair",
+        "translatex",
+        "translatey",
+        "useoutlines",
+        "variable",
+        "variablename",
+        "wasstatic",
+        "wordwrap",
+        "x",
+        "xmax",
+        "xmin",
+        "y",
+        "ymax",
+        "ymin",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +100,14 @@ class Paths:
     @property
     def ffdec_jar(self) -> Path:
         return self.root / "work/tools/ffdec-26.4.0/ffdec-cli.jar"
+
+    @property
+    def ffdec_lib(self) -> Path:
+        return self.root / "work/tools/ffdec-26.4.0/lib"
+
+    @property
+    def font_glyph_helper(self) -> Path:
+        return self.root / "scripts/FfdecFontGlyphs.java"
 
     @property
     def inventory(self) -> Path:
@@ -210,6 +257,101 @@ def run_ffdec(paths: Paths, *arguments: object) -> None:
     )
 
 
+def run_font_glyph_helper(
+    paths: Paths,
+    source: Path,
+    destination: Path,
+    font_files_manifest: Path,
+    font_ids_file: Path,
+    glyphs_file: Path,
+) -> None:
+    java = shutil.which("java")
+    if java is None:
+        raise RuntimeError("java executable is not available on PATH")
+    helper = require_regular_file(paths, paths.font_glyph_helper)
+    ffdec_lib = under_root(paths, paths.ffdec_lib)
+    if ffdec_lib.is_symlink() or not ffdec_lib.is_dir():
+        raise RuntimeError(f"FFDec library directory is unavailable: {ffdec_lib}")
+    for path in [source, destination.parent, font_files_manifest, font_ids_file, glyphs_file]:
+        under_root(paths, path)
+    # The audited base SWF alone is ~110 MiB; glyph outline injection across all
+    # referenced embedded fonts needs headroom beyond a 512 MiB heap.
+    subprocess.run(
+        [
+            java,
+            "-Xmx2g",
+            "--class-path",
+            str(ffdec_lib / "*"),
+            str(helper),
+            str(require_regular_file(paths, source)),
+            str(destination),
+            str(require_regular_file(paths, font_files_manifest)),
+            str(require_regular_file(paths, font_ids_file)),
+            str(require_regular_file(paths, glyphs_file)),
+        ],
+        cwd=paths.root,
+        check=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
+
+
+def fontconfig_family_key(value: str) -> str:
+    """Normalize fontconfig family names so 'Symbols 2' matches 'Symbols2'."""
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def noto_family_identity_matches(pattern: str, family_line: str) -> bool:
+    """True when fc-match family identity equals the requested Noto face."""
+    expected = fontconfig_family_key(pattern.split(":", maxsplit=1)[0])
+    if not expected:
+        return False
+    matched = {fontconfig_family_key(family) for family in family_line.split(",") if family.strip()}
+    return expected in matched
+
+
+def require_bmp_codepoints(text: str) -> str:
+    """FFDec FontTag.addCharacter accepts Java char only; reject supplementary planes."""
+    for character in text:
+        code_point = ord(character)
+        if code_point > 0xFFFF:
+            raise RuntimeError(
+                f"supplementary Unicode code point U+{code_point:04X} is unsupported by FFDec FontTag"
+            )
+    return text
+
+
+def stage_local_noto_font(paths: Paths, pattern: str, destination: Path) -> Path:
+    """Copy an exact locally installed Noto face into ignored work state."""
+    fc_match = shutil.which("fc-match")
+    if fc_match is None:
+        raise RuntimeError("fc-match is required to locate the local Noto Sans font")
+    probe = subprocess.run(
+        [fc_match, "--format=%{family}\n%{file}\n", pattern],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    match = probe.stdout.splitlines()
+    if len(match) != 2 or not noto_family_identity_matches(pattern, match[0]):
+        raise RuntimeError(
+            f"fc-match substituted '{pattern}' with an unexpected family: {probe.stdout!r}"
+        )
+    source = Path(match[1])
+    if (
+        source.is_symlink()
+        or not source.is_file()
+        or source.suffix.lower() not in {".ttf", ".ttc"}
+        or source.stat().st_size > MAX_FONT_BYTES
+        or "noto" not in source.name.casefold()
+    ):
+        raise RuntimeError(f"fc-match did not return a real Noto font for {pattern}: {source}")
+    target = under_root(paths, destination)
+    ensure_real_directory(paths, target.parent)
+    shutil.copy2(source, target)
+    return require_regular_file(paths, target)
+
+
 def reset_generated(paths: Paths, directory: Path) -> None:
     target = under_root(paths, directory)
     if target.exists() or target.is_symlink():
@@ -249,40 +391,89 @@ def publish_or_retract_patched(paths: Paths, language: str, candidate: Path, eli
         raise RuntimeError(f"eligible patch must remain a real regular file: {patched}")
 
 
-def formatted_parts(value: str) -> tuple[str, str]:
-    """Return an import prefix and semantic text from FFDec formatted output.
+def is_formatted_metadata(content: str) -> bool:
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    return bool(lines) and all(line.split(maxsplit=1)[0] in FORMATTED_DIRECTIVES for line in lines)
 
-    DefineEditText has one metadata block followed by text. DefineText can have
-    many interleaved style blocks; the replacement intentionally keeps the bounds
-    block and first style/font block, then emits one replacement run.
-    """
-    blocks: list[tuple[int, int, str]] = []
+
+def formatted_segments(value: str) -> list[tuple[bool, str]]:
+    """Split FFDec formatted text into exact metadata blocks and visible runs."""
+    segments: list[tuple[bool, str]] = []
     cursor = 0
-    semantic: list[str] = []
     while cursor < len(value):
-        if value[cursor] != "[":
-            next_block = value.find("[", cursor)
-            end = len(value) if next_block < 0 else next_block
-            semantic.append(value[cursor:end])
-            cursor = end
-            continue
-        end = value.find("]", cursor + 1)
-        if end < 0:
-            semantic.append(value[cursor:])
+        block_start = value.find("[", cursor)
+        if block_start < 0:
+            segments.append((False, value[cursor:]))
             break
-        content = value[cursor + 1 : end]
-        if not re.search(r"(?m)^(?:xmin|font|height|color|x|y|readonly|noselect|useoutlines)\b", content):
-            semantic.append(value[cursor : end + 1])
-            cursor = end + 1
+        if block_start > cursor:
+            segments.append((False, value[cursor:block_start]))
+        block_end = value.find("]", block_start + 1)
+        if block_end < 0:
+            segments.append((False, value[block_start:]))
+            break
+        content = value[block_start + 1 : block_end]
+        if is_formatted_metadata(content):
+            segments.append((True, value[block_start : block_end + 1]))
+            cursor = block_end + 1
             continue
-        blocks.append((cursor, end + 1, value[cursor : end + 1]))
-        cursor = end + 1
-    if not blocks or blocks[0][0] != 0:
+        segments.append((False, value[block_start : block_end + 1]))
+        cursor = block_end + 1
+    if not segments or not segments[0][0]:
         raise ValueError("FFDec formatted text lacks leading metadata")
-    prefix = blocks[0][2]
-    if "font " not in prefix and len(blocks) > 1:
-        prefix += blocks[1][2]
-    return prefix, "".join(semantic)
+    return segments
+
+
+def formatted_parts(value: str) -> tuple[str, str]:
+    """Return exact formatted metadata and semantic text."""
+    segments = formatted_segments(value)
+    return (
+        "".join(segment for metadata, segment in segments if metadata),
+        "".join(segment for metadata, segment in segments if not metadata),
+    )
+
+
+def formatted_replacement(value: str, replacement: str) -> str:
+    """Replace visible runs while preserving every FFDec metadata block byte-for-byte."""
+    segments = formatted_segments(value)
+    visible_indices = [
+        index for index, (metadata, segment) in enumerate(segments) if not metadata and segment
+    ]
+    source_lengths = [len(segments[index][1]) for index in visible_indices]
+    chunks: list[str] = []
+    consumed = 0
+    source_consumed = 0
+    source_total = sum(source_lengths)
+    for offset, source_length in enumerate(source_lengths):
+        source_consumed += source_length
+        end = (
+            len(replacement)
+            if offset == len(source_lengths) - 1
+            else round(len(replacement) * source_consumed / source_total)
+        )
+        chunks.append(replacement[consumed:end])
+        consumed = end
+    if not visible_indices:
+        chunks = [replacement]
+    # Multiple visible runs are static DefineText TEXTRECORDs with a UI8 glyph
+    # count. A sole run is DefineEditText text and does not have that limit.
+    if len(chunks) > 1 and any(len(chunk) > 255 for chunk in chunks):
+        raise RuntimeError("translated static text exceeds preserved TEXTRECORD capacity")
+    output: list[str] = []
+    chunk_index = 0
+    for metadata, segment in segments:
+        if metadata:
+            output.append(segment)
+        elif segment:
+            output.append(chunks[chunk_index])
+            chunk_index += 1
+    if not visible_indices:
+        output.append(chunks[0])
+    result = "".join(output)
+    source_metadata, _ = formatted_parts(value)
+    result_metadata, result_text = formatted_parts(result)
+    if result_metadata != source_metadata or result_text != replacement:
+        raise RuntimeError("formatted replacement did not preserve metadata or exact target text")
+    return result
 
 
 def line_endings(value: str) -> list[str]:
@@ -309,11 +500,13 @@ def inventory(paths: Paths) -> dict[str, Any]:
             continue
         formatted_path = formatted / plain_path.name
         formatted_value = read_text_file(paths, formatted_path)
-        header, formatted_body = formatted_parts(formatted_value)
+        metadata, formatted_body = formatted_parts(formatted_value)
         source = formatted_body
         if not source:
             continue
-        font_ids = sorted({int(value) for value in re.findall(r"(?m)^font\s+(\d+)\s*$", header)})
+        font_ids = sorted(
+            {int(value) for value in re.findall(r"(?m)^font\s+(\d+)\s*$", metadata)}
+        )
         entries.append(
             {
                 "id": int(plain_path.stem),
@@ -461,7 +654,9 @@ def nllb_translate(units: list[str], target: str, batch_size: int) -> list[str]:
         ) from error
     model = require_local_k_translate_model()
     translator = ctranslate2.Translator(str(model), device="cpu", intra_threads=4)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model, local_files_only=True)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model, local_files_only=True, fix_mistral_regex=True
+    )
     tokenizer.src_lang = "zho_Hans"
     output: list[str] = []
     for offset in range(0, len(units), batch_size):
@@ -472,6 +667,9 @@ def nllb_translate(units: list[str], target: str, batch_size: int) -> list[str]:
             target_prefix=[[target] for _ in sources],
             max_batch_size=batch_size,
             batch_type="examples",
+            max_decoding_length=192,
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.1,
         )
         for result in results:
             tokens = result.hypotheses[0][1:]
@@ -581,19 +779,33 @@ def qa_report(paths: Paths, language: str) -> dict[str, Any]:
     language = require_language(language)
     inventory_data = read_json(paths, paths.inventory)
     translation = read_json(paths, paths.translation(language))
-    source_by_id = {entry["id"]: entry for entry in inventory_data["entries"]}
-    target_by_id = {entry["id"]: entry for entry in translation["entries"]}
+    source_entries = inventory_data["entries"]
+    target_entries = translation["entries"]
+    source_ids = [strict_int_id(entry["id"]) for entry in source_entries]
+    target_ids = [strict_int_id(entry["id"]) for entry in target_entries]
+    source_by_id = dict(zip(source_ids, source_entries, strict=True))
+    target_by_id = dict(zip(target_ids, target_entries, strict=True))
     expected = set(source_by_id)
     actual = set(target_by_id)
     issues: list[dict[str, Any]] = []
+    for identifier, count in Counter(source_ids).items():
+        if count > 1:
+            issues.append({"id": identifier, "kind": "duplicate_inventory_id"})
+    for identifier, count in Counter(target_ids).items():
+        if count > 1:
+            issues.append({"id": identifier, "kind": "duplicate_translation_id"})
     layout_risks: list[dict[str, Any]] = []
     for identifier in sorted(expected & actual):
         source_entry = source_by_id[identifier]
         target_entry = target_by_id[identifier]
         source = source_entry["source"]
         target = target_entry["text"]
+        if source_entry["source_sha256"] != text_hash(source):
+            issues.append({"id": identifier, "kind": "inventory_source_hash_mismatch"})
         if target_entry["source_sha256"] != source_entry["source_sha256"]:
             issues.append({"id": identifier, "kind": "source_hash_mismatch"})
+        if target_entry["text_sha256"] != text_hash(target):
+            issues.append({"id": identifier, "kind": "target_text_hash_mismatch"})
         if line_endings(source) != line_endings(target):
             issues.append({"id": identifier, "kind": "line_breaks_changed"})
         if missing_tokens(PLACEHOLDER, source, target):
@@ -634,6 +846,10 @@ def qa_report(paths: Paths, language: str) -> dict[str, Any]:
                 issue["kind"]
                 in {
                     "source_hash_mismatch",
+                    "inventory_source_hash_mismatch",
+                    "target_text_hash_mismatch",
+                    "duplicate_inventory_id",
+                    "duplicate_translation_id",
                     "line_breaks_changed",
                     "placeholder_or_name_lost",
                     "number_lost",
@@ -667,16 +883,65 @@ def patch(paths: Paths, language: str) -> dict[str, Any]:
     texts = import_root / "texts"
     texts.mkdir()
     formatted = paths.work / "inventory/export/formatted"
+    font_ids: set[int] = set()
     for identifier in sorted(target_by_id):
-        header, _ = formatted_parts(read_text_file(paths, formatted / f"{identifier}.txt"))
-        (texts / f"{identifier}.txt").write_text(
-            header + target_by_id[identifier], encoding="utf-8", newline=""
+        formatted_source = read_text_file(paths, formatted / f"{identifier}.txt")
+        metadata, _ = formatted_parts(formatted_source)
+        font_ids.update(
+            int(value) for value in re.findall(r"(?m)^font\s+(\d+)\s*$", metadata)
         )
+        (texts / f"{identifier}.txt").write_text(
+            formatted_replacement(formatted_source, target_by_id[identifier]),
+            encoding="utf-8",
+            newline="",
+        )
+    font_work = paths.work / f"fonts/{language}"
+    reset_generated(paths, font_work)
+    font_ids_file = font_work / "font-ids.txt"
+    glyphs_file = font_work / "glyphs.txt"
+    font_ids_file.write_text(
+        "".join(f"{value}\n" for value in sorted(font_ids)), encoding="utf-8"
+    )
+    glyphs = require_bmp_codepoints("".join(sorted(set("".join(target_by_id.values())))))
+    glyphs_file.write_text(glyphs, encoding="utf-8", newline="")
+    staged_fonts = [
+        stage_local_noto_font(
+            paths, "Noto Sans:style=Regular", font_work / "NotoSans-Regular.ttf"
+        ),
+        stage_local_noto_font(
+            paths,
+            "Noto Sans Symbols 2:style=Regular",
+            font_work / "NotoSansSymbols2-Regular.ttf",
+        ),
+        stage_local_noto_font(
+            paths,
+            "Noto Sans Symbols:style=Regular",
+            font_work / "NotoSansSymbols-Regular.ttf",
+        ),
+        stage_local_noto_font(
+            paths,
+            "Noto Sans CJK SC:style=Regular",
+            font_work / "NotoSansCJK-Regular.ttc",
+        ),
+    ]
+    font_sources = font_work / "font-files.txt"
+    font_sources.write_text(
+        "".join(f"{font}\n" for font in staged_fonts), encoding="utf-8"
+    )
+    font_ready = font_work / "font-ready.swf"
+    run_font_glyph_helper(
+        paths,
+        paths.base,
+        font_ready,
+        font_sources,
+        font_ids_file,
+        glyphs_file,
+    )
     candidate = under_root(paths, paths.candidate(language))
     ensure_real_directory(paths, candidate.parent)
     if candidate.exists() or candidate.is_symlink():
         candidate.unlink()
-    run_ffdec(paths, "-importText", paths.base, candidate, import_root)
+    run_ffdec(paths, "-importText", font_ready, candidate, import_root)
     patched_hash = sha256(require_regular_file(paths, candidate))
     if patched_hash == BASE_SHA256:
         raise RuntimeError(f"FFDec produced an unchanged {language} SWF")
@@ -689,25 +954,41 @@ def patch(paths: Paths, language: str) -> dict[str, Any]:
         "-selectid",
         ids,
         "-format",
-        "text:plain",
+        "text:formatted",
         "-export",
         "text",
         verify_dir,
         candidate,
     )
     mismatches = []
+    metadata_normalized = []
     for identifier, expected in sorted(target_by_id.items()):
         exported = verify_dir / f"{identifier}.txt"
-        if (
-            not exported.is_file()
-            or exported.is_symlink()
-            or exported.read_bytes() != expected.encode("utf-8")
-        ):
+        imported = texts / f"{identifier}.txt"
+        if not exported.is_file() or exported.is_symlink():
             mismatches.append(identifier)
+            continue
+        exported_metadata, exported_text = formatted_parts(
+            read_text_file(paths, exported)
+        )
+        imported_metadata, _ = formatted_parts(read_text_file(paths, imported))
+        if exported_text != expected or HAN.search(exported_text):
+            mismatches.append(identifier)
+        if exported_metadata != imported_metadata:
+            metadata_normalized.append(identifier)
     roundtrip_exact = not mismatches
     # Retract ineligible (or republish eligible atomically) before the final
     # activation JSON is written, so filesystem and status cannot disagree.
-    status = activation_status(paths, language, patched_hash, report, roundtrip_exact, mismatches)
+    status = activation_status(
+        paths,
+        language,
+        patched_hash,
+        report,
+        roundtrip_exact,
+        mismatches,
+        font_coverage=True,
+        metadata_normalized=metadata_normalized,
+    )
     publish_or_retract_patched(paths, language, candidate, bool(status["eligible"]))
     write_json(paths, paths.activation(language), status)
     return status
@@ -780,6 +1061,9 @@ def activation_status(
     report: dict[str, Any],
     roundtrip_exact: bool,
     mismatches: list[int],
+    *,
+    font_coverage: bool = False,
+    metadata_normalized: list[int] | None = None,
 ) -> dict[str, Any]:
     language = require_language(language)
     approval_path = paths.work / f"approvals/{language}.json"
@@ -804,6 +1088,7 @@ def activation_status(
         "coverage_100": report["translated_ids"] == EXPECTED_HAN and not report["missing_ids"],
         "qa_valid": report["structural_pass"] and report["quality_review_pass"],
         "roundtrip_exact": roundtrip_exact,
+        "font_coverage": font_coverage,
         "font_valid": font_valid,
         "layout_valid": layout_valid,
         "gameplay_valid": gameplay_valid,
@@ -823,6 +1108,12 @@ def activation_status(
         "prerequisites": prerequisites,
         "eligible": all(prerequisites.values()),
         "blockers": blockers,
+        "roundtrip": {
+            "exact_ids": EXPECTED_HAN - len(mismatches),
+            "total_ids": EXPECTED_HAN,
+            "mismatch_ids": mismatches,
+            "formatted_metadata_normalized_ids": metadata_normalized or [],
+        },
         "artifact": {
             "candidate": str(paths.candidate(language).relative_to(paths.root)),
             "patched": str(paths.patched(language).relative_to(paths.root)),

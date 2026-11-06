@@ -104,3 +104,14 @@
   extend synthetic FR selection proof through the play reporting path.
 - Record the bounded Ruffle evidence: an EN research candidate reached a loading
   screen, which is not treated as a translated product or gameplay validation.
+- Preserve every FFDec formatted metadata block during replacement, distribute
+  long static text across existing UI8-sized text records, locally add required
+  Noto glyph outlines to all 13 referenced embedded fonts, and reach exact
+  semantic re-export for 241/241 EN and 241/241 FR IDs without residual Han.
+- Keep both corrected candidates fail-closed: NLLB review, measured layout
+  overflow, full visual review, and gameplay approval remain mandatory before
+  publication to the launcher-owned `patched/` path.
+- Reject Fontconfig family substitutions, unsupported supplementary glyphs,
+  oversized helper inputs, duplicate translation IDs, and forged text hashes;
+  bind font coverage and detailed round-trip state into the Rust activation
+  contract instead of trusting the top-level eligibility claim alone.
