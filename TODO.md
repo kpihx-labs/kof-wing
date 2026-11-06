@@ -9,6 +9,14 @@
   diagnostics.
 - [x] Add named profiles.
 - [ ] Add deterministic input replay and save snapshots.
+- [x] Add versioned per-profile i18n with complete external EN/FR catalogues,
+  safe canonical BCP 47 IDs, strict reported fallback, language CLI import/export,
+  translated wrapper generation, and LAN fingerprint binding.
+- [ ] Translate and visually validate all 241 Han-bearing static main-SWF text
+  symbols plus script-generated and external `skillList.swf` text before enabling
+  any production embedded patch; current embedded coverage is intentionally 0.
+- [ ] Add the production FFDec patch manifest only after every symbol passes base
+  hash, round-trip export, embedded-font/layout, Ruffle smoke, and gameplay gates.
 - [x] Add optional authentic and modern input presets.
 - [x] Deliver a fully editable keyboard/gamepad schema and CLI with per-player
   and per-device profiles, modeled axes/deadzones/chords, conflict detection,

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "catalog_version": 1,
+  "id": "fr",
+  "name": "Français",
+  "fallback": null,
+  "messages": {
+    "coverage.blocker": "Les textes intégrés au jeu ne sont pas activés tant que chaque symbole sélectionné et son rendu de police n'ont pas passé une vérification hash-gated.",
+    "coverage.embedded": "Textes intégrés au jeu",
+    "coverage.owned": "Lanceur et menu enveloppe",
+    "coverage.title": "Couverture de traduction",
+    "menu.doctor": "Vérifier l'installation",
+    "menu.input": "Configurer les contrôles",
+    "menu.lan": "Réseau local",
+    "menu.language": "Langue",
+    "menu.play": "Jouer",
+    "menu.quit": "Quitter",
+    "menu.subtitle": "Lanceur portable de préservation",
+    "menu.title": "The King of Fighters Wing EX",
+    "notice.embedded": "Le menu enveloppe traduit est complet. Certains écrans du SWF original restent en chinois et sont signalés comme bloqués, jamais présentés silencieusement comme traduits.",
+    "status.blocked": "Bloqué",
+    "status.ready": "Prêt"
+  }
+}

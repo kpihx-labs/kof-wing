@@ -159,14 +159,44 @@ fn stage_projector(source: &VerifiedSource, extracted_dir: &Path) -> Result<Name
     Ok(staged)
 }
 
+/// Owns the cross-process exclusive lock until wrapper generation and runtime
+/// use finish. Never unlink the lock file: waiters must share the same inode.
+#[derive(Debug)]
+pub struct GeneratedOverlay {
+    root: PathBuf,
+    _lock: File,
+}
+
+impl std::ops::Deref for GeneratedOverlay {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.root
+    }
+}
+
 pub fn generate_overlay(
     source: &VerifiedSource,
     work: &Path,
     profile_name: &str,
     config: &ProfileConfig,
-) -> Result<PathBuf> {
+) -> Result<GeneratedOverlay> {
     validate_overlay(config)?;
-    let root = work.join("profiles").join(profile_name).join("overlay");
+    crate::profile::validate_name(profile_name)?;
+    let profile_root = work.join("profiles").join(profile_name);
+    fs::create_dir_all(&profile_root)?;
+    // std uses OS locks on both Unix and Windows; closing the handle (including
+    // process termination) releases ownership without stale PID/timeout logic.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(profile_root.join("overlay.lock"))
+        .context("cannot open overlay lock")?;
+    lock.lock()
+        .context("cannot acquire exclusive overlay lock")?;
+    let root = profile_root.join("overlay");
     if root.exists() {
         fs::remove_dir_all(&root)
             .with_context(|| format!("cannot refresh generated overlay {}", root.display()))?;
@@ -199,7 +229,7 @@ pub fn generate_overlay(
             .chain(config.stage.assignments.iter()),
     )?;
     append_manifest(&root.join("sound/list.txt"), config.music.tracks.iter())?;
-    Ok(root)
+    Ok(GeneratedOverlay { root, _lock: lock })
 }
 
 /// Copies one child through handles anchored at the verified source root.
@@ -301,12 +331,9 @@ fn open_source_root(root: &Path) -> Result<File> {
 #[cfg(windows)]
 fn open_source_root(root: &Path) -> Result<File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::{
-        Foundation::SYNCHRONIZE,
-        Storage::FileSystem::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
-        },
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
     };
 
     let file = fs::OpenOptions::new()
@@ -416,6 +443,127 @@ mod tests {
 
     fn synthetic_verified(root: &Path) -> VerifiedSource {
         verify_source(root).unwrap()
+    }
+
+    // Re-executed in a separate OS process by the tests below. No payload or
+    // timing-based sleeps: the parent/child handshake uses stdout and OS locks.
+    #[test]
+    fn overlay_process_worker() {
+        use std::io::Write;
+        let Some(root) = std::env::var_os("KOF_OVERLAY_TEST_ROOT") else {
+            return;
+        };
+        let root = Path::new(&root);
+        let work = root.join("work");
+        let mode = std::env::var("KOF_OVERLAY_TEST_MODE").unwrap();
+        if mode == "waiter" {
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(work.join("profiles/test/overlay.lock"))
+                .unwrap();
+            assert!(matches!(
+                lock.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+            println!("LOCK_BLOCKED");
+            std::io::stdout().flush().unwrap();
+        }
+        let verified = synthetic_verified(&root.join("original"));
+        for _ in 0..8 {
+            let overlay = generate_overlay(&verified, &work, "test", &Default::default()).unwrap();
+            let language = crate::i18n::resolve("en", &root.join("catalogs")).unwrap();
+            let wrapper = crate::i18n::write_wrapper(&overlay, &language).unwrap();
+            assert!(fs::read_to_string(wrapper).unwrap().contains("</html>"));
+            assert_eq!(
+                fs::read(overlay.join("data/skillList.swf")).unwrap(),
+                b"fixture"
+            );
+            if mode == "holder" {
+                println!("LOCK_HELD");
+                std::io::stdout().flush().unwrap();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).unwrap();
+            }
+        }
+    }
+
+    fn overlay_worker(root: &Path, mode: &str) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "source::tests::overlay_process_worker",
+                "--nocapture",
+            ])
+            .env("KOF_OVERLAY_TEST_ROOT", root)
+            .env("KOF_OVERLAY_TEST_MODE", mode)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    fn await_worker(child: &mut std::process::Child, marker: &str) {
+        use std::io::BufRead;
+        let mut output = std::io::BufReader::new(child.stdout.as_mut().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "worker exited before {marker}"
+            );
+            if line.trim() == marker {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_lock_serializes_processes_through_wrapper_and_releases_on_drop() {
+        let temp = tempdir().unwrap();
+        synthetic_source(&temp.path().join("original"), b"fixture");
+        let verified = synthetic_verified(&temp.path().join("original"));
+        let overlay = generate_overlay(
+            &verified,
+            &temp.path().join("work"),
+            "test",
+            &Default::default(),
+        )
+        .unwrap();
+        let language = crate::i18n::resolve("en", &temp.path().join("catalogs")).unwrap();
+        let wrapper = crate::i18n::write_wrapper(&overlay, &language).unwrap();
+        let mut child = overlay_worker(temp.path(), "waiter");
+        await_worker(&mut child, "LOCK_BLOCKED");
+        assert!(wrapper.is_file());
+        drop(overlay);
+        assert!(child.wait_with_output().unwrap().status.success());
+        let children: Vec<_> = (0..4)
+            .map(|_| overlay_worker(temp.path(), "stress"))
+            .collect();
+        for child in children {
+            assert!(child.wait_with_output().unwrap().status.success());
+        }
+    }
+
+    #[test]
+    fn overlay_lock_is_released_after_process_termination() {
+        let temp = tempdir().unwrap();
+        synthetic_source(&temp.path().join("original"), b"fixture");
+        let mut child = overlay_worker(temp.path(), "holder");
+        await_worker(&mut child, "LOCK_HELD");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let verified = synthetic_verified(&temp.path().join("original"));
+        assert!(
+            generate_overlay(
+                &verified,
+                &temp.path().join("work"),
+                "test",
+                &Default::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

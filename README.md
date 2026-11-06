@@ -153,6 +153,76 @@ Ruffle as a canonical, percent-encoded `file://` directory URL with a trailing
 slash, so relative Flash loads resolve consistently on Linux and Windows.
 Source manifests and assets remain untouched.
 
+### Versioned languages and honest coverage
+
+Language selection is part of each versioned profile and therefore part of the
+canonical LAN compatibility fingerprint. The repository-owned `locales/en.json`
+and `locales/fr.json` catalogues both cover all 15 launcher/wrapper messages with
+no fallback. Catalogues use canonical, path-safe BCP 47 IDs (`en`, `fr`,
+`fr-CA`, `zh-Hans-CN`); schema and catalogue versions are explicit.
+
+Here "canonical" means **project syntax/casing normalization only**, not full
+BCP 47 registry canonicalization. The manual parser accepts a path-safe ASCII
+subset limited to 2-63 bytes, normalizes language/script/region casing and
+rejects repeated variants/extension singletons. It does not validate the IANA
+registry, extlang/variant prefixes or extension-specific semantics, resolve
+grandfathered tags, rewrite deprecated/preferred values (`iw` remains `iw`, not
+`he`), or sort extension sequences. Some grandfathered forms fail syntax checks;
+others happen to fit the grammar but are not recognized as registry entries.
+Aliases remain distinct profile/LAN identities; registry-equivalent IDs are not
+promised equal fingerprints. Use the exact documented ID for interoperability.
+
+```console
+kof-wing --profile default language list
+kof-wing --profile default language show
+kof-wing --profile default language set fr
+kof-wing --profile default language validate
+kof-wing --profile default language import ./fr-CA.json
+kof-wing --profile default language export ./active-language.json
+kof-wing --profile default language export --id en ./english.json
+```
+
+`language show` always emits a machine-readable coverage report followed by any
+fallback and blocker lines. An incomplete catalogue is usable only when its
+declared fallback resolves every required key; every fallback key count and chain
+is reported. Missing keys, cycles, unavailable fallbacks, unsafe IDs, unknown
+schema fields, zero versions, oversized files, and destructive exports fail.
+Imports replace only the profile-local catalogue atomically. Replacing the
+selected catalogue with a different `catalog_version` requires an explicit
+`language set` refresh before `show`, `doctor`, `play`, or LAN compatibility
+reuse it. Exports never overwrite a file or follow a destination symlinked path.
+
+Installed JSON filenames must be exactly `<catalog.id>.json` with the project's
+normalized casing. Duplicate local IDs fail explicitly rather than depending on
+directory enumeration order; one correctly named local override of a builtin is
+allowed. Import source filenames are unrestricted; installation assigns the
+validated canonical filename.
+
+Overlay refresh holds a per-profile OS-backed exclusive file lock outside the
+replaceable `overlay/` directory. The returned overlay guard keeps it held through
+wrapper writing and runtime use, serializing concurrent doctor/play processes.
+The persistent `overlay.lock` file is never unlinked; the OS releases ownership
+on handle drop or process termination. No symlink/hardlink is used. This needs
+Rust 1.89+ and a filesystem supporting OS file locks; lock errors are surfaced,
+not bypassed. Different profiles remain independent.
+
+`doctor` and `play` generate
+`work/profiles/<name>/overlay/kof-wing-menu.html`, a complete EN/FR companion
+wrapper menu. It does not pretend to replace the SWF UI. The audited main SWF has
+675 non-empty exported static text symbols, 241 containing Han characters;
+production-verified embedded translation coverage is currently **0/241**.
+`data/skillList.swf` and script-generated text also need a complete inventory.
+Consequently no partial FFDec translation is activated and the game can still
+show Chinese internally. This avoids silently shipping a half-Chinese interface.
+
+FFDec 26.4.0 was locally verified to patch a selected static text ID when given
+the required formatted `texts/` import tree: the generated SWF hash changed and a
+fresh selected-ID export round-tripped the replacement exactly. That mechanism
+remains blocked for production until every translated symbol passes the audited
+base hash, exact round-trip, embedded-font coverage, layout screenshots, Ruffle
+smoke, and gameplay gates. Generated SWFs remain under ignored `work/`; no
+proprietary binary is versioned. See `research/i18n-audit.md`.
+
 ## Historical 0.1.0 LAN boundary
 
 The first 0.1.0 launcher slice implemented only `lan doctor`: it reported UDP
@@ -178,7 +248,8 @@ still not assumed.
 Compatibility now binds the protocol, audited SWF, Ruffle policy, canonical
 profile and input configuration, Sunshine/Moonlight versions, all four pinned
 archive
-hashes, app name, resolution, frame rate, bitrate, display mode, audio layout,
+hashes, the effective resolved language contract and wrapper messages, app name,
+resolution, frame rate, bitrate, display mode, audio layout,
 multi-controller, game-optimization, frame-pacing, codec, quit-after, explicit
 PIN/stdin policy, encryption, UPnP, web-origin, and private-interface policies.
 

@@ -35,10 +35,35 @@ pub enum Command {
         #[command(subcommand)]
         command: InputCommand,
     },
+    /// List, inspect, select, validate, import, and export language catalogs.
+    Language {
+        #[command(subcommand)]
+        command: LanguageCommand,
+    },
     /// Discover, negotiate, and opt into pinned same-subnet LAN transport.
     Lan {
         #[command(subcommand)]
         command: LanCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LanguageCommand {
+    /// List built-in and profile-installed catalogs.
+    List,
+    /// Show the active resolved catalog and its non-silent coverage report.
+    Show,
+    /// Select an installed BCP 47 language for this profile.
+    Set { id: String },
+    /// Validate one catalog, or every installed catalog when ID is omitted.
+    Validate { id: Option<String> },
+    /// Validate and atomically install a JSON catalog into this profile.
+    Import { path: PathBuf },
+    /// Export the active or selected catalog to a new JSON file.
+    Export {
+        path: PathBuf,
+        #[arg(long)]
+        id: Option<String>,
     },
 }
 

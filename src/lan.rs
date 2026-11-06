@@ -379,18 +379,21 @@ pub fn local_compatibility(profile_name: &str) -> Result<Compatibility> {
     let profile = ProfilePaths::discover(profile_name)?;
     let config = profile.require_config()?;
     let input = profile.require_input()?;
+    let language = crate::i18n::compatibility_contract(&config.language, &profile.catalogs)?;
     Ok(compatibility_from_profile(
-        canonical_profile(&config, &input)?.as_bytes(),
+        canonical_profile(&config, &input, &language)?.as_bytes(),
     ))
 }
 
 fn canonical_profile(
     config: &crate::config::ProfileConfig,
     input: &crate::input::InputConfig,
+    language_contract: &str,
 ) -> Result<String> {
     let canonical_profile = format!(
-        "{}\n--- input-v{} ---\n{}",
+        "{}\n--- language ---\n{}\n--- input-v{} ---\n{}",
         toml::to_string(&config).context("cannot canonicalize profile config")?,
+        language_contract,
         input.version,
         input
             .canonical_toml()
@@ -1847,19 +1850,36 @@ mod tests {
         let first_input = make_input(&[("south", "j"), ("east", "k")]);
         let same_input = make_input(&[("EAST", "K"), ("SOUTH", "J")]);
         let changed_input = make_input(&[("south", "j"), ("east", "l")]);
+        let english_contract =
+            r#"{"language":"en","catalog_version":1,"messages":{"menu.play":"Play"}}"#;
+        let french_contract =
+            r#"{"language":"fr","catalog_version":1,"messages":{"menu.play":"Jouer"}}"#;
         let first = compatibility(
-            canonical_profile(&profile, &first_input)
+            canonical_profile(&profile, &first_input, english_contract)
                 .unwrap()
                 .as_bytes(),
         );
-        let same = compatibility(canonical_profile(&profile, &same_input).unwrap().as_bytes());
+        let same = compatibility(
+            canonical_profile(&profile, &same_input, english_contract)
+                .unwrap()
+                .as_bytes(),
+        );
         let changed = compatibility(
-            canonical_profile(&profile, &changed_input)
+            canonical_profile(&profile, &changed_input, english_contract)
+                .unwrap()
+                .as_bytes(),
+        );
+        let mut french_profile = crate::config::ProfileConfig::default();
+        french_profile.language.id = "fr".to_owned();
+        let french = compatibility(
+            canonical_profile(&french_profile, &first_input, french_contract)
                 .unwrap()
                 .as_bytes(),
         );
         assert_eq!(first, same);
         assert_ne!(first.profile_sha256, changed.profile_sha256);
         assert_ne!(first.session_sha256, changed.session_sha256);
+        assert_ne!(first.profile_sha256, french.profile_sha256);
+        assert_ne!(first.session_sha256, french.session_sha256);
     }
 }

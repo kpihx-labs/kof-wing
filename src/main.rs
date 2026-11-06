@@ -3,9 +3,9 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result};
 use clap::Parser;
 use kof_wing::{
-    cli::{Cli, Command, InputCommand, InputFormat, LanCommand, ProfileCommand},
+    cli::{Cli, Command, InputCommand, InputFormat, LanCommand, LanguageCommand, ProfileCommand},
     config::ProfileConfig,
-    default_work_dir,
+    default_work_dir, i18n,
     input::{Binding, FieldUpdate, InputConfig, InputSource, atomic_write_new},
     lan,
     profile::{self, ProfilePaths},
@@ -25,12 +25,120 @@ fn run() -> Result<()> {
     match cli.command {
         Command::Profile { command } => profile_command(command),
         Command::Input { command } => input_command(command, &cli.profile),
+        Command::Language { command } => language_command(command, &cli.profile),
         Command::Lan { command } => {
             lan_command(command, cli.source.as_deref(), &cli.profile, &work)
         }
         Command::Doctor => doctor(cli.source.as_deref(), &cli.profile, &work),
         Command::Play(options) => play(cli.source.as_deref(), &cli.profile, &work, &options),
     }
+}
+
+fn language_command(command: LanguageCommand, profile_name: &str) -> Result<()> {
+    let profile = ProfilePaths::discover(profile_name)?;
+    match command {
+        LanguageCommand::List => {
+            let active = profile.require_config()?.language.id;
+            for catalog in i18n::list(&profile.catalogs)? {
+                let marker = if catalog.id == active { "*" } else { " " };
+                println!(
+                    "{marker} {} v{} ({})",
+                    catalog.id, catalog.catalog_version, catalog.name
+                );
+            }
+        }
+        LanguageCommand::Show => {
+            let config = profile.require_config()?;
+            let resolved = i18n::resolve_selected(&config.language, &profile.catalogs)?;
+            println!("{}", serde_json::to_string_pretty(&resolved.coverage)?);
+            if resolved.coverage.owned_fallback > 0 {
+                println!(
+                    "[fallback] {} message(s) via {}",
+                    resolved.coverage.owned_fallback,
+                    resolved.coverage.fallback_chain.join(" -> ")
+                );
+            } else {
+                println!("[ok] no fallback used");
+            }
+            for blocker in &resolved.coverage.embedded_blockers {
+                println!("[blocker] {blocker}");
+            }
+        }
+        LanguageCommand::Set { id } => {
+            let canonical = i18n::canonical_language_id(&id)?;
+            let resolved = i18n::resolve(&canonical, &profile.catalogs)?;
+            if !resolved.coverage.missing.is_empty() {
+                anyhow::bail!(
+                    "catalog '{}' cannot drive the complete wrapper; missing: {}",
+                    canonical,
+                    resolved.coverage.missing.join(", ")
+                );
+            }
+            let mut config = profile.require_config()?;
+            config.language.id = canonical.clone();
+            config.language.catalog_version = resolved.catalog.catalog_version;
+            config.write_atomic(&profile.config)?;
+            println!(
+                "selected language {canonical} catalog v{} for profile '{}'",
+                resolved.catalog.catalog_version, profile.name
+            );
+            if resolved.coverage.owned_fallback > 0 {
+                println!(
+                    "[fallback] {} message(s) via {}",
+                    resolved.coverage.owned_fallback,
+                    resolved.coverage.fallback_chain.join(" -> ")
+                );
+            }
+        }
+        LanguageCommand::Validate { id } => {
+            let ids = if let Some(id) = id {
+                vec![i18n::canonical_language_id(&id)?]
+            } else {
+                i18n::list(&profile.catalogs)?
+                    .into_iter()
+                    .map(|catalog| catalog.id)
+                    .collect()
+            };
+            for id in ids {
+                let resolved = i18n::resolve(&id, &profile.catalogs)?;
+                println!(
+                    "[ok] {} v{}: direct {}/{}, fallback {}, missing {}",
+                    id,
+                    resolved.catalog.catalog_version,
+                    resolved.coverage.owned_direct,
+                    resolved.coverage.owned_total,
+                    resolved.coverage.owned_fallback,
+                    resolved.coverage.missing.len()
+                );
+                if !resolved.coverage.fallback_chain.is_empty() {
+                    println!(
+                        "[fallback] {}",
+                        resolved.coverage.fallback_chain.join(" -> ")
+                    );
+                }
+                if !resolved.coverage.missing.is_empty() {
+                    anyhow::bail!(
+                        "catalog '{id}' has unresolved messages: {}",
+                        resolved.coverage.missing.join(", ")
+                    );
+                }
+            }
+        }
+        LanguageCommand::Import { path } => {
+            let destination = i18n::install(&path, &profile.catalogs)?;
+            println!("imported {}", destination.display());
+        }
+        LanguageCommand::Export { path, id } => {
+            let config = profile.require_config()?;
+            let resolved = match id {
+                Some(id) => i18n::resolve(&id, &profile.catalogs)?,
+                None => i18n::resolve_selected(&config.language, &profile.catalogs)?,
+            };
+            i18n::export(&resolved.catalog, &path)?;
+            println!("exported {}", path.display());
+        }
+    }
+    Ok(())
 }
 
 fn input_command(command: InputCommand, profile_name: &str) -> Result<()> {
@@ -254,12 +362,26 @@ fn doctor(source_path: Option<&Path>, profile_name: &str, work: &Path) -> Result
     println!("[ok] current Ruffle executable: {}", executable.display());
     let profile = ProfilePaths::discover(profile_name)?;
     let config = profile.require_config()?;
+    let language = i18n::resolve_selected(&config.language, &profile.catalogs)?;
     let input = profile.require_input()?;
     input
         .ruffle_mappings()
         .context("input profile is valid but cannot be applied by the pinned runtime")?;
     let overlay = source::generate_overlay(&verified, work, profile_name, &config)?;
+    let wrapper = i18n::write_wrapper(&overlay, &language)?;
     println!("[ok] profile config: {}", profile.config.display());
+    println!(
+        "[ok] language: {} catalog v{}; wrapper {}/{} direct, {} fallback",
+        language.catalog.id,
+        language.catalog.catalog_version,
+        language.coverage.owned_direct,
+        language.coverage.owned_total,
+        language.coverage.owned_fallback
+    );
+    for blocker in &language.coverage.embedded_blockers {
+        println!("[blocker] embedded localization: {blocker}");
+    }
+    println!("[ok] translated wrapper: {}", wrapper.display());
     println!("[ok] input config: {}", profile.input.display());
     println!("[ok] generated overlay: {}", overlay.display());
     Ok(())
@@ -276,9 +398,11 @@ fn play(
     runtime::verify_archives(work)?;
     let profile = ProfilePaths::discover(profile_name)?;
     let config: ProfileConfig = profile.require_config()?;
+    let language = i18n::resolve_selected(&config.language, &profile.catalogs)?;
     let input = profile.require_input()?;
     let swf = source::prepare_swf(&verified, work)?;
     let overlay = source::generate_overlay(&verified, work, profile_name, &config)?;
+    i18n::write_wrapper(&overlay, &language)?;
     let platform = runtime::Platform::current().map_err(anyhow::Error::msg)?;
     let executable = runtime::locate(work, platform)?;
     if options.dry_run {

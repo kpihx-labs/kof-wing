@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "catalog_version": 1,
+  "id": "en",
+  "name": "English",
+  "fallback": null,
+  "messages": {
+    "coverage.blocker": "Embedded game text is not activated until every selected symbol and its font rendering pass hash-gated verification.",
+    "coverage.embedded": "Embedded game text",
+    "coverage.owned": "Launcher and wrapper",
+    "coverage.title": "Translation coverage",
+    "menu.doctor": "Check installation",
+    "menu.input": "Configure controls",
+    "menu.lan": "Local network",
+    "menu.language": "Language",
+    "menu.play": "Play",
+    "menu.quit": "Quit",
+    "menu.subtitle": "Portable preservation launcher",
+    "menu.title": "The King of Fighters Wing EX",
+    "notice.embedded": "The translated wrapper is complete. Some original SWF screens remain Chinese and are reported as blocked, never silently presented as translated.",
+    "status.blocked": "Blocked",
+    "status.ready": "Ready"
+  }
+}

@@ -3,11 +3,15 @@ use std::{collections::BTreeMap, fs, path::Path};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::input::{atomic_write, atomic_write_new};
+use crate::{
+    i18n::LanguageConfig,
+    input::{atomic_write, atomic_write_new},
+};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfileConfig {
+    pub language: LanguageConfig,
     pub stage: StageOverlay,
     pub music: MusicOverlay,
     #[serde(skip_serializing)]
@@ -59,7 +63,7 @@ impl ProfileConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        Ok(())
+        self.language.validate()
     }
 }
 
@@ -90,6 +94,7 @@ mod tests {
         )
         .expect("valid config");
         assert_eq!(config.stage.assignments["kyo"], "temple");
+        assert_eq!(config.language.id, "en");
     }
 
     #[test]

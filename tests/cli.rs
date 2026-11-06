@@ -10,9 +10,158 @@ fn help_exposes_preservation_commands() {
         .expect("run launcher help");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
-    for command in ["doctor", "play", "profile", "input", "lan"] {
+    for command in ["doctor", "play", "profile", "input", "language", "lan"] {
         assert!(stdout.contains(command), "help omitted {command}");
     }
+}
+
+#[test]
+fn language_cli_is_versioned_complete_atomic_and_non_silent() {
+    let temp = tempdir().expect("temp dir");
+    let config_home = temp.path().join("config");
+    let data_home = temp.path().join("data");
+    let cache_home = temp.path().join("cache");
+    let work = temp.path().join("work");
+    let export = temp.path().join("fr-export.json");
+    let binary = env!("CARGO_BIN_EXE_kof-wing");
+    let run = |arguments: &[&str]| {
+        Command::new(binary)
+            .args(arguments)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_DATA_HOME", &data_home)
+            .env("XDG_CACHE_HOME", &cache_home)
+            .env("KOF_WING_WORK", &work)
+            .output()
+            .expect("run language command")
+    };
+
+    assert!(run(&["profile", "create", "localized"]).status.success());
+    let list = run(&["--profile", "localized", "language", "list"]);
+    let list_stdout = String::from_utf8(list.stdout).unwrap();
+    assert!(list.status.success());
+    assert!(list_stdout.contains("* en v1"));
+    assert!(list_stdout.contains("  fr v1"));
+
+    assert!(
+        run(&["--profile", "localized", "language", "set", "fr"])
+            .status
+            .success()
+    );
+    let show = run(&["--profile", "localized", "language", "show"]);
+    let show_stdout = String::from_utf8(show.stdout).unwrap();
+    assert!(show.status.success());
+    assert!(show_stdout.contains("\"language\": \"fr\""));
+    assert!(show_stdout.contains("\"owned_direct\": 15"));
+    assert!(show_stdout.contains("\"owned_fallback\": 0"));
+    assert!(show_stdout.contains("\"embedded_verified_patched\": 0"));
+    assert!(show_stdout.contains("[blocker]"));
+
+    let import = temp.path().join("fr-CA.json");
+    std::fs::write(
+        &import,
+        r#"{
+          "schema_version": 1,
+          "catalog_version": 2,
+          "id": "fr-CA",
+          "name": "Français canadien",
+          "fallback": "fr",
+          "messages": {"menu.play": "Jouer au jeu"}
+        }"#,
+    )
+    .unwrap();
+    let import_string = import.to_string_lossy().into_owned();
+    assert!(
+        run(&[
+            "--profile",
+            "localized",
+            "language",
+            "import",
+            &import_string,
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        run(&["--profile", "localized", "language", "set", "fr-CA",])
+            .status
+            .success()
+    );
+    let fallback = run(&["--profile", "localized", "language", "show"]);
+    let fallback_stdout = String::from_utf8(fallback.stdout).unwrap();
+    assert!(fallback.status.success());
+    assert!(fallback_stdout.contains("\"owned_fallback\": 14"));
+    assert!(fallback_stdout.contains("\"fallback_chain\": [\n    \"fr\""));
+    assert!(fallback_stdout.contains("[fallback] 14 message(s) via fr"));
+    assert!(
+        run(&["--profile", "localized", "language", "set", "fr"])
+            .status
+            .success()
+    );
+
+    let replacement = temp.path().join("fr-v2.json");
+    std::fs::write(
+        &replacement,
+        include_str!("../locales/fr.json").replacen(
+            "\"catalog_version\": 1",
+            "\"catalog_version\": 2",
+            1,
+        ),
+    )
+    .unwrap();
+    let replacement_string = replacement.to_string_lossy().into_owned();
+    assert!(
+        run(&[
+            "--profile",
+            "localized",
+            "language",
+            "import",
+            &replacement_string,
+        ])
+        .status
+        .success()
+    );
+    let stale = run(&["--profile", "localized", "language", "show"]);
+    let stale_stderr = String::from_utf8(stale.stderr).unwrap();
+    assert!(!stale.status.success());
+    assert!(stale_stderr.contains("expects catalog v1"));
+    assert!(
+        run(&["--profile", "localized", "language", "set", "fr"])
+            .status
+            .success()
+    );
+
+    let export_string = export.to_string_lossy().into_owned();
+    assert!(
+        run(&[
+            "--profile",
+            "localized",
+            "language",
+            "export",
+            &export_string,
+        ])
+        .status
+        .success()
+    );
+    assert!(export.is_file());
+    assert!(
+        !run(&[
+            "--profile",
+            "localized",
+            "language",
+            "export",
+            &export_string,
+        ])
+        .status
+        .success()
+    );
+
+    let config =
+        std::fs::read_to_string(config_home.join("kof-wing/profiles/localized/config.toml"))
+            .unwrap();
+    assert!(config.contains("[language]"));
+    assert!(config.contains("schema_version = 1"));
+    assert!(config.contains("id = \"fr\""));
+    assert!(config.contains("catalog_version = 2"));
 }
 
 #[test]

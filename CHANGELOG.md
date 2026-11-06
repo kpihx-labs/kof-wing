@@ -61,3 +61,26 @@
 - Canonicalize semantically equivalent input mappings for LAN hashes, reject
   stale Sunshine channel policy, and reverify extracted Windows transport files
   against their pinned archives before reuse.
+- Add strict version-1 per-profile language selection and external versioned EN/FR
+  catalogues with canonical path-safe BCP 47 IDs plus `language list`, `show`,
+  `set`, `validate`, `import`, and `export` commands.
+- Make fallback and translation coverage explicit, bind language/catalog version
+  into LAN compatibility, and generate a complete translated wrapper menu while
+  reporting the still-untranslated embedded SWF instead of claiming completeness.
+- Require the selected catalog version to match the installed active catalog,
+  hash the effective resolved language contract into LAN compatibility, reject
+  symlinked i18n import/export directories, cap catalog size before parsing, and
+  emit a restrictive CSP in the generated wrapper.
+- Audit 675 exported static text symbols (241 Han-bearing), verify FFDec's
+  hash-gated symbolic text-import/round-trip mechanism on the local payload, and
+  keep production SWF patching blocked pending complete font/layout/gameplay
+  validation; no proprietary binary is versioned.
+- Reject mismatched local catalog filenames and duplicate local IDs explicitly;
+  test multi-catalog fallback cycles and unavailable transitive fallbacks.
+- Bound language normalization to the supported path-safe BCP 47 syntax/casing
+  subset, without claiming IANA registry/preferred-value canonicalization.
+- Serialize overlay refresh, wrapper writing, and runtime use with a per-profile
+  cross-process OS file lock (Rust 1.89+), tested with synthetic concurrent workers
+  and forced process termination; record a reproducible selected-ID FFDec probe.
+- Correct the Windows `SYNCHRONIZE` import and Unix-only test imports; validate
+  all targets/features with warning-denying Windows cross-target Clippy.
