@@ -271,12 +271,12 @@ fn append_manifest<'a>(
     if !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str("# Generated profile overrides; original manifest remains unchanged.\n");
     for (key, value) in entries {
+        text.push('&');
         text.push_str(key);
         text.push('=');
         text.push_str(value);
-        text.push('\n');
+        text.push_str("&\n");
     }
     fs::write(destination, text)
         .with_context(|| format!("cannot write generated manifest {}", destination.display()))
@@ -406,7 +406,7 @@ mod tests {
         fs::create_dir_all(root.join("stage")).unwrap();
         fs::create_dir_all(root.join("sound")).unwrap();
         fs::create_dir_all(root.join("data")).unwrap();
-        fs::write(root.join("stage/list.txt"), "base=stage/base.swf\n").unwrap();
+        fs::write(root.join("stage/list.txt"), "&base=stage/base.swf&\n").unwrap();
         fs::write(root.join("stage/base.swf"), marker).unwrap();
         fs::write(root.join("sound/list.txt"), "base=sound/base.mp3\n").unwrap();
         fs::write(root.join("sound/base.mp3"), marker).unwrap();
@@ -514,11 +514,11 @@ mod tests {
         let overlay = generate_overlay(&verified, &work, "test", &config).expect("overlay");
         let generated_stage =
             fs::read_to_string(overlay.join("stage/list.txt")).expect("generated stage manifest");
-        assert!(generated_stage.contains("base=stage/base.swf"));
-        assert!(generated_stage.contains("custom=mods/custom.swf"));
+        assert!(generated_stage.contains("&base=stage/base.swf&"));
+        assert!(generated_stage.contains("&custom=mods/custom.swf&"));
         assert_eq!(
             fs::read_to_string(source_root.join("stage/list.txt")).expect("original manifest"),
-            "base=stage/base.swf\n"
+            "&base=stage/base.swf&\n"
         );
         let runtime_data = overlay.join("data/skillList.swf");
         assert!(
