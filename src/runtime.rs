@@ -363,6 +363,7 @@ mod tests {
             )
             .unwrap();
         let options = crate::cli::PlayArgs {
+            dry_run: false,
             fullscreen: false,
             window: true,
             scale: 2,

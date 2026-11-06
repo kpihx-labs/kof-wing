@@ -16,6 +16,17 @@ fn help_exposes_preservation_commands() {
 }
 
 #[test]
+fn play_help_exposes_non_executing_command_inspection() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kof-wing"))
+        .args(["play", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("--dry-run"));
+}
+
+#[test]
 fn doctor_without_source_fails_with_actionable_message() {
     let output = Command::new(env!("CARGO_BIN_EXE_kof-wing"))
         .env_remove("KOF_SOURCE")

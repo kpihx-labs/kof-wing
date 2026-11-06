@@ -281,6 +281,14 @@ fn play(
     let overlay = source::generate_overlay(&verified, work, profile_name, &config)?;
     let platform = runtime::Platform::current().map_err(anyhow::Error::msg)?;
     let executable = runtime::locate(work, platform)?;
+    if options.dry_run {
+        let arguments = runtime::arguments(&swf, &overlay, &profile, &input, options)?;
+        println!(
+            "{:?}",
+            std::process::Command::new(&executable).args(arguments)
+        );
+        return Ok(());
+    }
     runtime::launch(&executable, &swf, &overlay, &profile, &input, options)
         .context("game launch failed")
 }

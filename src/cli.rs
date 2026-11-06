@@ -44,6 +44,10 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct PlayArgs {
+    /// Print the exact pinned Ruffle command without launching it.
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Start Ruffle in fullscreen mode.
     #[arg(long, conflicts_with = "window")]
     pub fullscreen: bool,
