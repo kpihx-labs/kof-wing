@@ -3,7 +3,11 @@ use std::{fs, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 
-use crate::{APP_NAME, config::ProfileConfig, input::InputConfig};
+use crate::{
+    APP_NAME,
+    config::ProfileConfig,
+    input::{Binding, DeviceKind, FieldUpdate, InputConfig, InputSource},
+};
 
 #[derive(Debug, Clone)]
 pub struct ProfilePaths {
@@ -95,7 +99,35 @@ impl ProfilePaths {
                 self.name
             );
         }
-        ProfileConfig::read(&self.config)
+        let mut config = ProfileConfig::read(&self.config)?;
+        if !config.controls.gamepad.is_empty() {
+            let mut input = self.require_input()?;
+            for (button, target) in &config.controls.gamepad {
+                input.set_binding(
+                    "p1",
+                    "legacy-gamepad-p1",
+                    DeviceKind::Gamepad,
+                    FieldUpdate::Keep,
+                    FieldUpdate::Keep,
+                    Binding {
+                        source: InputSource::Button {
+                            button: button.clone(),
+                        },
+                        target: target.clone(),
+                        chord: Vec::new(),
+                    },
+                )?;
+            }
+            input.validate()?;
+            input.write_atomic(&self.input)?;
+        }
+        if !config.controls.gamepad.is_empty()
+            || fs::read_to_string(&self.config)?.contains("[controls.gamepad]")
+        {
+            config.controls.gamepad.clear();
+            config.write_atomic(&self.config)?;
+        }
+        Ok(config)
     }
 
     pub fn require_input(&self) -> Result<InputConfig> {

@@ -3,13 +3,21 @@ use std::{collections::BTreeMap, fs, path::Path};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::input::atomic_write_new;
+use crate::input::{atomic_write, atomic_write_new};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfileConfig {
     pub stage: StageOverlay,
     pub music: MusicOverlay,
+    #[serde(skip_serializing)]
+    pub controls: LegacyControls,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LegacyControls {
+    pub gamepad: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -42,6 +50,12 @@ impl ProfileConfig {
         let text = toml::to_string_pretty(self).context("cannot serialize profile config")?;
         atomic_write_new(path, text.as_bytes())
             .with_context(|| format!("cannot create profile config {}", path.display()))
+    }
+
+    pub fn write_atomic(&self, path: &Path) -> Result<()> {
+        let text = toml::to_string_pretty(self).context("cannot serialize profile config")?;
+        atomic_write(path, text.as_bytes())
+            .with_context(|| format!("cannot update profile config {}", path.display()))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -81,5 +95,14 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         assert!(toml::from_str::<ProfileConfig>("mystery = true").is_err());
+    }
+
+    #[test]
+    fn reads_deprecated_gamepad_section_but_never_serializes_it() {
+        let config: ProfileConfig =
+            toml::from_str("[controls.gamepad]\nsouth = 'j'").expect("legacy config");
+        assert_eq!(config.controls.gamepad["south"], "j");
+        let serialized = toml::to_string(&config).expect("serialize migrated config");
+        assert!(!serialized.contains("controls"));
     }
 }
