@@ -55,6 +55,8 @@ fn language_cli_is_versioned_complete_atomic_and_non_silent() {
     assert!(show_stdout.contains("\"owned_fallback\": 0"));
     assert!(show_stdout.contains("\"embedded_verified_patched\": 0"));
     assert!(show_stdout.contains("[blocker]"));
+    assert!(show_stdout.contains("[blocked] embedded SWF patch inactive"));
+    assert!(show_stdout.contains("using audited base SWF"));
 
     let import = temp.path().join("fr-CA.json");
     std::fs::write(

@@ -11,3 +11,4 @@
 | LAN | Two physical same-subnet PCs complete versus matches without Internet |
 | Replay | Recorded inputs reproduce a local match on the same runtime version |
 | Packaging | No proprietary SWF, stage, music or extracted asset is distributed |
+| Embedded localization | 241/241 reviewed translations, exact per-ID round trip, font coverage, layout captures, Ruffle/gameplay approval, and matching generated hash; currently blocked |

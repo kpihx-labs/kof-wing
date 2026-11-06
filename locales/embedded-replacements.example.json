@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "language": "en",
+  "base_sha256": "d124733aecf3998fea353266a809b4d62bff0c154a82464510c7000578388334",
+  "author": "kof-wing maintainers",
+  "replacements": {
+    "900001": "Synthetic author-written replacement used only as a manifest example"
+  },
+  "reviewed_ids": [900001],
+  "notice": "Copy this schema to ignored work/i18n/overrides/<language>.json. Replacements must be author-written or locally reviewed; never commit extracted or machine-translated proprietary game text."
+}

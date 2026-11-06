@@ -192,7 +192,7 @@ pub fn doctor(work: &Path, profile_name: &str, network: &LanNetworkArgs) {
         }
     }
 
-    match local_compatibility(profile_name) {
+    match local_compatibility(work, profile_name) {
         Ok(contract) => {
             println!("  [ok] SWF contract SHA-256: {}", contract.swf_sha256);
             println!(
@@ -246,9 +246,13 @@ pub fn doctor(work: &Path, profile_name: &str, network: &LanNetworkArgs) {
     println!("LAN gameplay readiness: unavailable until the physical two-PC gate passes");
 }
 
-pub fn discover(profile_name: &str, args: &LanDiscoveryArgs) -> Result<Vec<DiscoveredSession>> {
+pub fn discover(
+    work: &Path,
+    profile_name: &str,
+    args: &LanDiscoveryArgs,
+) -> Result<Vec<DiscoveredSession>> {
     let interface = checked_interface(&args.network)?;
-    let local = local_compatibility(profile_name)?;
+    let local = local_compatibility(work, profile_name)?;
     discover_with_contract(&interface, &local, args)
 }
 
@@ -267,7 +271,7 @@ pub fn host(work: &Path, profile_name: &str, args: &LanHostArgs) -> Result<()> {
         args.transport != HostTransport::Sunshine || address_allowed(interface.address.into()),
         "Sunshine transport cannot use --allow-public; select a private, loopback, or link-local interface"
     );
-    let compatibility = local_compatibility(profile_name)?;
+    let compatibility = local_compatibility(work, profile_name)?;
     let descriptor = session_descriptor(interface.address, &compatibility, args)?;
     let discovery = bind_socket(args.network.bind, args.network.discovery_port, "discovery")?;
     let negotiation = bind_socket(args.network.bind, args.network.session_port, "negotiation")?;
@@ -326,13 +330,13 @@ pub fn host(work: &Path, profile_name: &str, args: &LanHostArgs) -> Result<()> {
     }
 }
 
-pub fn join(profile_name: &str, args: &LanJoinArgs) -> Result<SessionDescriptor> {
+pub fn join(work: &Path, profile_name: &str, args: &LanJoinArgs) -> Result<SessionDescriptor> {
     let interface = checked_interface(&args.discovery.network)?;
     ensure!(
         args.transport != JoinTransport::Moonlight || address_allowed(interface.address.into()),
         "Moonlight transport cannot use --allow-public; select a private, loopback, or link-local interface"
     );
-    let local = local_compatibility(profile_name)?;
+    let local = local_compatibility(work, profile_name)?;
     let (endpoint, expected_session_id) = if let Some(endpoint) = args.host {
         ensure!(
             endpoint.port() != 0,
@@ -375,13 +379,21 @@ pub fn join(profile_name: &str, args: &LanJoinArgs) -> Result<SessionDescriptor>
     Ok(session)
 }
 
-pub fn local_compatibility(profile_name: &str) -> Result<Compatibility> {
+pub fn local_compatibility(work: &Path, profile_name: &str) -> Result<Compatibility> {
     let profile = ProfilePaths::discover(profile_name)?;
     let config = profile.require_config()?;
     let input = profile.require_input()?;
     let language = crate::i18n::compatibility_contract(&config.language, &profile.catalogs)?;
+    let base = work.join("extracted/kof-wing-ex-v1.0.swf");
+    let embedded = crate::i18n::select_embedded_swf(work, &config.language.id, &base)?;
+    let swf_sha256 = if embedded.active {
+        crate::source::sha256(&embedded.swf)?
+    } else {
+        SWF_SHA256.to_owned()
+    };
     Ok(compatibility_from_profile(
         canonical_profile(&config, &input, &language)?.as_bytes(),
+        &swf_sha256,
     ))
 }
 
@@ -402,18 +414,18 @@ fn canonical_profile(
     Ok(canonical_profile)
 }
 
-fn compatibility_from_profile(profile: &[u8]) -> Compatibility {
+fn compatibility_from_profile(profile: &[u8], swf_sha256: &str) -> Compatibility {
     let runtime_sha256 = sha256_bytes(runtime_contract().as_bytes());
     let profile_sha256 = sha256_bytes(profile);
     let transport_sha256 = sha256_bytes(transport::contract().as_bytes());
     let session_sha256 = session_contract_hash(
-        SWF_SHA256,
+        swf_sha256,
         &runtime_sha256,
         &profile_sha256,
         &transport_sha256,
     );
     Compatibility {
-        swf_sha256: SWF_SHA256.to_owned(),
+        swf_sha256: swf_sha256.to_owned(),
         runtime_sha256,
         profile_sha256,
         transport_sha256,
@@ -1245,7 +1257,7 @@ mod tests {
     use super::*;
 
     fn compatibility(profile: &[u8]) -> Compatibility {
-        compatibility_from_profile(profile)
+        compatibility_from_profile(profile, SWF_SHA256)
     }
 
     fn loopback_host_args() -> LanHostArgs {
@@ -1782,6 +1794,10 @@ mod tests {
         );
         assert_ne!(contract.session_sha256, legacy_session_hash);
         validate_compatibility(&contract).unwrap();
+
+        let patched = compatibility_from_profile(b"profile", "synthetic-patched-swf-hash");
+        assert_eq!(patched.swf_sha256, "synthetic-patched-swf-hash");
+        assert_ne!(patched.session_sha256, contract.session_sha256);
     }
 
     #[test]

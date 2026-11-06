@@ -7,6 +7,7 @@ check:
 	@cargo fmt --all -- --check
 	@cargo clippy --all-targets --all-features -- -D warnings
 	@cargo test --all-targets --all-features
+	@uv run --no-project python -m unittest tests/test_i18n_pipeline.py
 	@cargo build --release
 	@shellcheck scripts/*.sh
 	@./scripts/doctor.sh

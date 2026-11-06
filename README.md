@@ -223,6 +223,29 @@ base hash, exact round-trip, embedded-font coverage, layout screenshots, Ruffle
 smoke, and gameplay gates. Generated SWFs remain under ignored `work/`; no
 proprietary binary is versioned. See `research/i18n-audit.md`.
 
+The reproducible local pipeline is now `scripts/i18n-pipeline.py`. It exports
+plain and formatted text from the audited base, inventories exactly 241
+Han-bearing IDs, translates EN/FR in local NLLB batches through the installed
+`k-translate` model store, preserves line endings and protected tokens, emits QA
+without source text, imports formatted replacements, and freshly re-exports all
+selected IDs. Generated text and SWFs stay under ignored `work/i18n/`; the only
+tracked replacement manifest is synthetic.
+
+The current run is deliberately **disabled**. NLLB produced 241/241 research
+candidates for each language with no lost source number/placeholder/line break
+and no Han, but none has human review; 202 EN and 201 FR IDs have length/layout
+risk. FFDec changed both candidate hashes, yet only ID `26696` round-tripped
+exactly (1/241 per language). It reported missing Latin glyphs in embedded fonts
+and rejected one spacing record. Incomplete outputs stay under
+`work/i18n/candidates/` and are never published to the launcher activation path
+`work/i18n/patched/`, never launched, and never presented as finished EN/FR
+products. `doctor`, `language show`, and `play` report a clear embedded block and
+keep the audited base SWF. The launcher selects a patched SWF only when the
+generated activation manifest proves 100% coverage plus QA, exact round trip,
+font, layout, and gameplay prerequisites and its hash matches. An activated
+patch hash also replaces the base SWF hash in the canonical LAN/session
+contract. See `research/i18n-pipeline-audit.md` for exact hashes and evidence.
+
 ## Historical 0.1.0 LAN boundary
 
 The first 0.1.0 launcher slice implemented only `lan doctor`: it reported UDP
@@ -233,9 +256,9 @@ complete.
 
 ## Verification
 
-`make check` runs formatting verification, strict Clippy, all tests, a release
-build, ShellCheck, and pinned local-tool checks. Tests use synthetic fixtures and
-do not require or reproduce proprietary data.
+`make check` runs formatting verification, strict Clippy, Rust tests, synthetic
+Python pipeline tests, a release build, ShellCheck, and pinned local-tool checks.
+Tests do not require or reproduce proprietary data.
 
 ## LAN transport (current)
 

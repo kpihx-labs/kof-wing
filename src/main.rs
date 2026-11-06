@@ -25,7 +25,7 @@ fn run() -> Result<()> {
     match cli.command {
         Command::Profile { command } => profile_command(command),
         Command::Input { command } => input_command(command, &cli.profile),
-        Command::Language { command } => language_command(command, &cli.profile),
+        Command::Language { command } => language_command(command, &cli.profile, &work),
         Command::Lan { command } => {
             lan_command(command, cli.source.as_deref(), &cli.profile, &work)
         }
@@ -34,7 +34,7 @@ fn run() -> Result<()> {
     }
 }
 
-fn language_command(command: LanguageCommand, profile_name: &str) -> Result<()> {
+fn language_command(command: LanguageCommand, profile_name: &str, work: &Path) -> Result<()> {
     let profile = ProfilePaths::discover(profile_name)?;
     match command {
         LanguageCommand::List => {
@@ -63,6 +63,9 @@ fn language_command(command: LanguageCommand, profile_name: &str) -> Result<()> 
             for blocker in &resolved.coverage.embedded_blockers {
                 println!("[blocker] {blocker}");
             }
+            let base = work.join("extracted/kof-wing-ex-v1.0.swf");
+            let embedded = i18n::select_embedded_swf(work, &resolved.catalog.id, &base)?;
+            i18n::report_embedded_selection(&embedded);
         }
         LanguageCommand::Set { id } => {
             let canonical = i18n::canonical_language_id(&id)?;
@@ -265,7 +268,7 @@ fn lan_command(
             println!("Desktop is not exposed; UPnP is disabled; remote web UI access is denied");
         }
         LanCommand::Discover(args) => {
-            let sessions = lan::discover(profile_name, &args)?;
+            let sessions = lan::discover(work, profile_name, &args)?;
             if sessions.is_empty() {
                 println!("no LAN sessions discovered");
             }
@@ -288,7 +291,7 @@ fn lan_command(
         }
         LanCommand::Host(args) => return lan::host(work, profile_name, &args),
         LanCommand::Join(args) => {
-            let session = lan::join(profile_name, &args)?;
+            let session = lan::join(work, profile_name, &args)?;
             println!("session negotiation accepted: {}", session.session_id);
             println!("authoritative host: {}", session.negotiation_endpoint);
             println!(
@@ -315,7 +318,7 @@ fn lan_command(
                 host: args.host,
                 transport: kof_wing::cli::JoinTransport::Moonlight,
             };
-            let session = lan::join(profile_name, &join)?;
+            let session = lan::join(work, profile_name, &join)?;
             println!("one-time pairing requires a person at the Sunshine host terminal");
             println!("enter the Moonlight PIN there; pairing is never automatic");
             kof_wing::transport::pair_client(
@@ -352,9 +355,9 @@ fn doctor(source_path: Option<&Path>, profile_name: &str, work: &Path) -> Result
         "[info] projector SHA-256: {} (payload identity is the preservation gate)",
         verified.projector_hash
     );
-    let swf = source::prepare_swf(&verified, work)?;
+    let base_swf = source::prepare_swf(&verified, work)?;
     println!("[ok] known SWF SHA-256: {}", source::SWF_SHA256);
-    println!("[ok] extracted payload: {}", swf.display());
+    println!("[ok] extracted payload: {}", base_swf.display());
     runtime::verify_archives(work)?;
     println!("[ok] pinned Linux and Windows Ruffle archives");
     let platform = runtime::Platform::current().map_err(anyhow::Error::msg)?;
@@ -363,6 +366,7 @@ fn doctor(source_path: Option<&Path>, profile_name: &str, work: &Path) -> Result
     let profile = ProfilePaths::discover(profile_name)?;
     let config = profile.require_config()?;
     let language = i18n::resolve_selected(&config.language, &profile.catalogs)?;
+    let embedded = i18n::select_embedded_swf(work, &language.catalog.id, &base_swf)?;
     let input = profile.require_input()?;
     input
         .ruffle_mappings()
@@ -381,6 +385,7 @@ fn doctor(source_path: Option<&Path>, profile_name: &str, work: &Path) -> Result
     for blocker in &language.coverage.embedded_blockers {
         println!("[blocker] embedded localization: {blocker}");
     }
+    i18n::report_embedded_selection(&embedded);
     println!("[ok] translated wrapper: {}", wrapper.display());
     println!("[ok] input config: {}", profile.input.display());
     println!("[ok] generated overlay: {}", overlay.display());
@@ -400,7 +405,10 @@ fn play(
     let config: ProfileConfig = profile.require_config()?;
     let language = i18n::resolve_selected(&config.language, &profile.catalogs)?;
     let input = profile.require_input()?;
-    let swf = source::prepare_swf(&verified, work)?;
+    let base_swf = source::prepare_swf(&verified, work)?;
+    let embedded = i18n::select_embedded_swf(work, &language.catalog.id, &base_swf)?;
+    i18n::report_embedded_selection(&embedded);
+    let swf = embedded.swf;
     let overlay = source::generate_overlay(&verified, work, profile_name, &config)?;
     i18n::write_wrapper(&overlay, &language)?;
     let platform = runtime::Platform::current().map_err(anyhow::Error::msg)?;

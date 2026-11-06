@@ -84,3 +84,23 @@
   and forced process termination; record a reproducible selected-ID FFDec probe.
 - Correct the Windows `SYNCHRONIZE` import and Unix-only test imports; validate
   all targets/features with warning-denying Windows cross-target Clippy.
+- Add a local-only, reproducible 241-ID FFDec/NLLB EN/FR pipeline with protected
+  tokens and line endings, text-free QA reports, synthetic tests, generated SWF
+  copies, and exact selected-ID re-export checks.
+- Gate launcher selection of an embedded-language SWF on consistent 100%
+  coverage, QA, exact round trip, font, layout, gameplay, fixed path, and hash
+  prerequisites, and bind any activated patch hash into LAN compatibility;
+  current generated EN/FR outputs remain disabled because only
+  1/241 IDs round-trip and embedded fonts reject required Latin glyphs.
+- Keep incomplete embedded candidates under `work/i18n/candidates/`, publish to
+  `patched/` only when eligible, reject activation symlinks/oversized manifests,
+  harden the local NLLB/FFDec pipeline path and subprocess limits, and make
+  `play`/`doctor`/`language show` report a clear embedded block while launching
+  the audited base SWF.
+- Require local visual approval `reviewed_ids` to equal the inventory/translation
+  Han ID set exactly (no duplicates, bools, or coerced values), reject every
+  symlink path component on Python reads/writes, publish eligible patches
+  atomically while retracting ineligible ones before final activation state, and
+  extend synthetic FR selection proof through the play reporting path.
+- Record the bounded Ruffle evidence: an EN research candidate reached a loading
+  screen, which is not treated as a translated product or gameplay validation.

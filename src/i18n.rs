@@ -14,6 +14,7 @@ pub const CATALOG_SCHEMA_VERSION: u32 = 1;
 pub const EMBEDDED_TEXT_SYMBOLS: usize = 675;
 pub const EMBEDDED_HAN_SYMBOLS: usize = 241;
 const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
+const MAX_ACTIVATION_BYTES: u64 = 256 * 1024;
 
 const EN: &str = include_str!("../locales/en.json");
 const FR: &str = include_str!("../locales/fr.json");
@@ -163,6 +164,187 @@ pub struct ResolvedCatalog {
     pub catalog: Catalog,
     pub messages: BTreeMap<String, String>,
     pub coverage: CoverageReport,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedPrerequisites {
+    pub coverage_100: bool,
+    pub qa_valid: bool,
+    pub roundtrip_exact: bool,
+    pub font_valid: bool,
+    pub layout_valid: bool,
+    pub gameplay_valid: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedActivation {
+    pub schema_version: u32,
+    pub language: String,
+    pub base_sha256: String,
+    pub patched_sha256: String,
+    pub coverage_total: usize,
+    pub coverage_translated: usize,
+    pub prerequisites: EmbeddedPrerequisites,
+    pub eligible: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddedSelection {
+    pub swf: PathBuf,
+    pub active: bool,
+    pub status: Option<EmbeddedActivation>,
+    pub blockers: Vec<String>,
+}
+
+pub fn select_embedded_swf(work: &Path, language: &str, base: &Path) -> Result<EmbeddedSelection> {
+    let canonical = canonical_language_id(language)?;
+    if !matches!(canonical.as_str(), "en" | "fr") {
+        return Ok(EmbeddedSelection {
+            swf: base.to_path_buf(),
+            active: false,
+            status: None,
+            blockers: vec![format!(
+                "no audited embedded patch contract exists for language '{canonical}'"
+            )],
+        });
+    }
+    let status_path = work
+        .join("i18n/activation")
+        .join(format!("{canonical}.json"));
+    match fs::symlink_metadata(&status_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(EmbeddedSelection {
+                swf: base.to_path_buf(),
+                active: false,
+                status: None,
+                blockers: vec![format!(
+                    "generated embedded activation status is absent: {}",
+                    status_path.display()
+                )],
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot stat {}", status_path.display()));
+        }
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "embedded activation status must be a real regular file: {}",
+                status_path.display()
+            );
+            ensure!(
+                metadata.len() <= MAX_ACTIVATION_BYTES,
+                "embedded activation status exceeds {} bytes",
+                MAX_ACTIVATION_BYTES
+            );
+        }
+    }
+    let status: EmbeddedActivation = serde_json::from_slice(
+        &fs::read(&status_path)
+            .with_context(|| format!("cannot read {}", status_path.display()))?,
+    )
+    .with_context(|| {
+        format!(
+            "invalid embedded activation status {}",
+            status_path.display()
+        )
+    })?;
+    ensure!(
+        status.schema_version == 1,
+        "unsupported embedded activation schema"
+    );
+    ensure!(
+        status.language == canonical,
+        "embedded activation language mismatch"
+    );
+    ensure!(
+        status.base_sha256 == crate::source::SWF_SHA256,
+        "embedded activation base hash mismatch"
+    );
+    let prerequisites = &status.prerequisites;
+    let all_prerequisites = prerequisites.coverage_100
+        && prerequisites.qa_valid
+        && prerequisites.roundtrip_exact
+        && prerequisites.font_valid
+        && prerequisites.layout_valid
+        && prerequisites.gameplay_valid;
+    let counts_complete = status.coverage_total == EMBEDDED_HAN_SYMBOLS
+        && status.coverage_translated == EMBEDDED_HAN_SYMBOLS;
+    if !status.eligible || !all_prerequisites || !counts_complete || !status.blockers.is_empty() {
+        let mut blockers = status.blockers.clone();
+        for (name, valid) in [
+            ("coverage_100", prerequisites.coverage_100),
+            ("qa_valid", prerequisites.qa_valid),
+            ("roundtrip_exact", prerequisites.roundtrip_exact),
+            ("font_valid", prerequisites.font_valid),
+            ("layout_valid", prerequisites.layout_valid),
+            ("gameplay_valid", prerequisites.gameplay_valid),
+        ] {
+            if !valid && !blockers.iter().any(|blocker| blocker == name) {
+                blockers.push(name.to_owned());
+            }
+        }
+        if !counts_complete {
+            blockers.push(format!(
+                "coverage counts incomplete: {}/{} translated of required {}",
+                status.coverage_translated, status.coverage_total, EMBEDDED_HAN_SYMBOLS
+            ));
+        }
+        if status.eligible {
+            blockers.push("activation manifest claims eligibility inconsistently".to_owned());
+        }
+        if blockers.is_empty() {
+            blockers.push(
+                "embedded patch is incomplete and must not replace the audited base SWF".to_owned(),
+            );
+        }
+        return Ok(EmbeddedSelection {
+            swf: base.to_path_buf(),
+            active: false,
+            status: Some(status),
+            blockers,
+        });
+    }
+    let patched = work
+        .join("i18n/patched")
+        .join(format!("kof-wing-ex-v1.0.{canonical}.swf"));
+    let metadata = fs::symlink_metadata(&patched)
+        .with_context(|| format!("eligible embedded patch is missing: {}", patched.display()))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "eligible embedded patch must be a real regular file"
+    );
+    ensure!(
+        crate::source::sha256(&patched)? == status.patched_sha256,
+        "eligible embedded patch hash mismatch"
+    );
+    Ok(EmbeddedSelection {
+        swf: patched,
+        active: true,
+        status: Some(status),
+        blockers: Vec::new(),
+    })
+}
+
+/// Report whether an embedded language SWF is active or blocked.
+pub fn report_embedded_selection(selection: &EmbeddedSelection) {
+    if selection.active {
+        println!(
+            "[ok] embedded SWF patch active: {}",
+            selection.swf.display()
+        );
+        return;
+    }
+    println!(
+        "[blocked] embedded SWF patch inactive; using audited base SWF: {}",
+        selection.swf.display()
+    );
+    for blocker in &selection.blockers {
+        println!("[blocker] embedded activation: {blocker}");
+    }
 }
 
 /// Normalize casing in our path-safe, 2-63 byte subset of BCP 47 syntax.
@@ -628,8 +810,9 @@ mod tests {
     #[cfg(unix)]
     use super::export;
     use super::{
-        Catalog, LanguageConfig, MAX_CATALOG_BYTES, canonical_language_id, compatibility_contract,
-        install, list, resolve, resolve_selected, write_wrapper,
+        Catalog, EmbeddedActivation, EmbeddedPrerequisites, LanguageConfig, MAX_CATALOG_BYTES,
+        canonical_language_id, compatibility_contract, install, list, report_embedded_selection,
+        resolve, resolve_selected, select_embedded_swf, write_wrapper,
     };
 
     #[test]
@@ -944,5 +1127,149 @@ mod tests {
         fs::write(&source, "x".repeat(MAX_CATALOG_BYTES as usize + 1)).unwrap();
         let error = install(&source, temp.path()).unwrap_err();
         assert!(error.to_string().contains("1 MiB"));
+    }
+
+    #[test]
+    fn embedded_patch_selection_is_fail_closed_and_hash_gated() {
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("base.swf");
+        fs::write(&base, b"synthetic base").unwrap();
+        let missing = select_embedded_swf(temp.path(), "en", &base).unwrap();
+        assert!(!missing.active);
+        assert_eq!(missing.swf, base);
+
+        let patched_dir = temp.path().join("i18n/patched");
+        let activation_dir = temp.path().join("i18n/activation");
+        fs::create_dir_all(&patched_dir).unwrap();
+        fs::create_dir_all(&activation_dir).unwrap();
+        let patched = patched_dir.join("kof-wing-ex-v1.0.en.swf");
+        fs::write(&patched, b"synthetic translated SWF").unwrap();
+        let mut status = EmbeddedActivation {
+            schema_version: 1,
+            language: "en".to_owned(),
+            base_sha256: crate::source::SWF_SHA256.to_owned(),
+            patched_sha256: crate::source::sha256(&patched).unwrap(),
+            coverage_total: super::EMBEDDED_HAN_SYMBOLS,
+            coverage_translated: super::EMBEDDED_HAN_SYMBOLS,
+            prerequisites: EmbeddedPrerequisites {
+                coverage_100: true,
+                qa_valid: true,
+                roundtrip_exact: true,
+                font_valid: true,
+                layout_valid: true,
+                gameplay_valid: true,
+            },
+            eligible: false,
+            blockers: vec!["synthetic review blocker".to_owned()],
+        };
+        fs::write(
+            activation_dir.join("en.json"),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !select_embedded_swf(temp.path(), "en", &base)
+                .unwrap()
+                .active
+        );
+
+        status.eligible = true;
+        status.blockers.clear();
+        fs::write(
+            activation_dir.join("en.json"),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+        let selected = select_embedded_swf(temp.path(), "en", &base).unwrap();
+        assert!(selected.active);
+        assert_eq!(selected.swf, patched);
+
+        fs::write(&patched, b"tampered").unwrap();
+        assert!(select_embedded_swf(temp.path(), "en", &base).is_err());
+    }
+
+    #[test]
+    fn fr_incomplete_embedded_patch_keeps_audited_base_and_reports_blockers() {
+        let temp = tempdir().unwrap();
+        let base = temp.path().join("base.swf");
+        fs::write(&base, b"synthetic audited base").unwrap();
+        let patched_dir = temp.path().join("i18n/patched");
+        let candidates_dir = temp.path().join("i18n/candidates");
+        let activation_dir = temp.path().join("i18n/activation");
+        fs::create_dir_all(&patched_dir).unwrap();
+        fs::create_dir_all(&candidates_dir).unwrap();
+        fs::create_dir_all(&activation_dir).unwrap();
+        // An incomplete candidate must never be selected, even if a language-
+        // suffixed file exists under patched/ or candidates/.
+        let incomplete = patched_dir.join("kof-wing-ex-v1.0.fr.swf");
+        let candidate = candidates_dir.join("kof-wing-ex-v1.0.fr.swf");
+        fs::write(&incomplete, b"synthetic incomplete fr patch").unwrap();
+        fs::write(&candidate, b"synthetic incomplete fr candidate").unwrap();
+        let status = EmbeddedActivation {
+            schema_version: 1,
+            language: "fr".to_owned(),
+            base_sha256: crate::source::SWF_SHA256.to_owned(),
+            patched_sha256: crate::source::sha256(&incomplete).unwrap(),
+            coverage_total: super::EMBEDDED_HAN_SYMBOLS,
+            coverage_translated: 1,
+            prerequisites: EmbeddedPrerequisites {
+                coverage_100: false,
+                qa_valid: false,
+                roundtrip_exact: false,
+                font_valid: false,
+                layout_valid: false,
+                gameplay_valid: false,
+            },
+            eligible: false,
+            blockers: vec![
+                "roundtrip_exact".to_owned(),
+                "font_valid".to_owned(),
+                "roundtrip_mismatch_ids:1".to_owned(),
+            ],
+        };
+        fs::write(
+            activation_dir.join("fr.json"),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+
+        let selected = select_embedded_swf(temp.path(), "fr", &base).unwrap();
+        assert!(!selected.active);
+        assert_eq!(selected.swf, base);
+        assert_ne!(selected.swf, incomplete);
+        assert_ne!(selected.swf, candidate);
+        assert!(
+            selected
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "coverage_100")
+        );
+        assert!(
+            selected
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "roundtrip_exact")
+        );
+        assert!(
+            selected
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("coverage counts incomplete"))
+        );
+
+        // Mirror the play/doctor reporting path: blocked FR keeps the audited
+        // base SWF that runtime dry-run would receive. Full `play --dry-run`
+        // still needs proprietary source/Ruffle archives, so this is the
+        // farthest proprietary-free proof of that selection contract.
+        report_embedded_selection(&selected);
+        let play_swf = selected.swf.clone();
+        assert_eq!(play_swf, base);
+        assert!(!selected.active);
+        assert!(
+            selected
+                .status
+                .as_ref()
+                .is_some_and(|value| !value.eligible)
+        );
     }
 }

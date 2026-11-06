@@ -17,6 +17,11 @@
   any production embedded patch; current embedded coverage is intentionally 0.
 - [ ] Add the production FFDec patch manifest only after every symbol passes base
   hash, round-trip export, embedded-font/layout, Ruffle smoke, and gameplay gates.
+- [x] Add the reproducible local inventory/NLLB/QA/FFDec pipeline, generated EN/FR
+  work copies, synthetic tests, and fail-closed launcher activation contract.
+- [ ] Resolve the measured embedded-font/FFDec import failure (current exact
+  round trip: 1/241 for EN and FR), then review every NLLB candidate and all
+  length/layout risks before setting any activation prerequisite true.
 - [x] Add optional authentic and modern input presets.
 - [x] Deliver a fully editable keyboard/gamepad schema and CLI with per-player
   and per-device profiles, modeled axes/deadzones/chords, conflict detection,

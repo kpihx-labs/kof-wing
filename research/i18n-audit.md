@@ -106,6 +106,23 @@ and produces `10af61418d392bfc7e89056e852e7cdea7aae79e25d80855223a85f28f52dd18`;
 that is a different prepared record, not the LF-normalized reproduction above.
 These are byte-level mechanism results, not font/layout/gameplay approval.
 
+## Full 241-ID pipeline result (2026-11-06)
+
+`scripts/i18n-pipeline.py` now reproduces the full static-text inventory and
+creates local EN/FR NLLB candidates and FFDec copies without tracking any game
+text. Structural translation QA passes for both languages: all 241 IDs exist,
+line endings and protected source tokens remain, and no Han remains. Translation
+quality does not pass because 0/241 candidates have human review and the report
+flags short-context, proper-name/credit, and layout ambiguities.
+
+The full FFDec import does not round-trip: only ID `26696` matches its requested
+replacement in each language. FFDec reports missing Latin glyphs (including
+font `40090`) and an invalid spacing record for ID `25878`. Generated hashes and
+the complete text-free result are in `research/i18n-pipeline-audit.md`. Both
+launcher activation manifests remain disabled, incomplete candidates are not
+published to the patched activation path, and the selected runtime payload is
+still the audited base SWF.
+
 Repository hygiene check:
 
 ```console
