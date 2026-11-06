@@ -159,3 +159,43 @@ passes, but quality review does not. The exact activation blockers for both
 languages are `qa_valid`, `font_valid`, `layout_valid`, `gameplay_valid`, and
 `missing_or_stale_local_visual_approval`; technical `font_coverage` is true,
 while visual font approval remains false.
+
+## Bilingual editorial candidate review (2026-11-06)
+
+All 241 EN entries and all 241 FR entries were reviewed again against the Chinese
+formatted source, the 180 distinct source-hash groups, duplicate records, and
+fighting-game UI context. The ignored candidate JSON now identifies this as a
+`bilingual_editorial_review`; it no longer attributes the edited strings to NLLB.
+This is an agent editorial pass, not human, visual, font, or gameplay approval.
+
+The review standardized fighting-game terminology for light/heavy attacks,
+Power Burst, Alternate Versions, Hidden Super Moves, Blowback Attacks,
+auto-guard, backdash, run, shortcuts, credits, and menu labels. Duplicate source
+groups now receive identical translations. Mixed-script contributor names were
+conservatively romanized where the no-Han structural gate required it; those
+romanizations remain a human-review item.
+
+| Gate | English | French |
+|---|---:|---:|
+| Candidate IDs editorially reviewed | 241/241 | 241/241 |
+| Distinct source-hash groups covered | 180/180 | 180/180 |
+| Structural QA pass | yes | yes |
+| Residual Han | 0 | 0 |
+| Lost protected tokens/numbers/HTML | 0 | 0 |
+| Changed line-ending sequences | 0 | 0 |
+| Human-reviewed IDs | 0/241 | 0/241 |
+| Length/layout risks | 169 | 190 |
+
+Compared with the preceding deterministic NLLB candidates, the heuristic layout
+risk count fell from 207 to 169 for EN and from 223 to 190 for FR. These counts
+are only character-length warnings; they do not prove that any string fits its
+original Flash bounds. The source contains internally inconsistent unlock and
+energy requirements, which were translated faithfully rather than reconciled.
+Historical RTMFP instructions were retained as original-game text, not rewritten
+as claims about the modern launcher LAN path.
+
+No SWF was rebuilt, activated, or published during this review. Existing
+candidate SWFs therefore predate these JSON edits. Both activation manifests
+remain `eligible=false`, the patched directory remains empty, and the fail-closed
+blockers remain human QA, visual font/layout approval, gameplay approval, and a
+fresh hash-specific local visual approval.

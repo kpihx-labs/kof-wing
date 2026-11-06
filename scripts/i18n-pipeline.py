@@ -820,7 +820,7 @@ def qa_report(paths: Paths, language: str) -> dict[str, Any]:
                 {"id": identifier, "source_characters": len(source), "target_characters": len(target)}
             )
         if not target_entry.get("human_reviewed", False):
-            issues.append({"id": identifier, "kind": "nllb_not_human_reviewed"})
+            issues.append({"id": identifier, "kind": "not_human_reviewed"})
         for reason in target_entry.get("ambiguities", []):
             issues.append({"id": identifier, "kind": f"ambiguity:{reason}"})
     hashes = defaultdict(list)
